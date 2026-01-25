@@ -15,10 +15,10 @@ LOG_DIR="$SCRIPT_DIR/logs"
 # 创建logs目录
 mkdir -p "$LOG_DIR"
 
-# 生成带时间戳的日志文件名
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-MAIN_LOG="$LOG_DIR/crawler_${TIMESTAMP}.log"
-ERROR_LOG="$LOG_DIR/error_${TIMESTAMP}.log"
+# 不再生成带时间戳的日志文件名，避免文件堆积
+# 不再生成带时间戳的日志文件名，避免文件堆积
+MAIN_LOG="$LOG_DIR/run.log"
+ERROR_LOG="$LOG_DIR/err.log"
 
 echo "============================================================"
 echo "东方财富股吧爬虫 - 后台启动"
@@ -39,6 +39,8 @@ fi
 
 
 # 启动爬虫（后台运行）
+# 重定向 stdout 到 console.log (仅供最后一次启动查看)
+# 重定向 stderr 到 startup_error.log (仅捕获启动时的解释器错误)
 echo "启动爬虫..."
 nohup python main.py > "$MAIN_LOG" 2> "$ERROR_LOG" &
 PID=$!
@@ -54,10 +56,11 @@ if ps -p $PID > /dev/null 2>&1; then
     echo ""
     echo "PID: $PID"
     echo "PID文件: $PID_FILE"
-    echo "主日志: $MAIN_LOG"
-    echo "错误日志: $ERROR_LOG"
+    # echo "控制台输出: $MAIN_LOG"  <-- 注释掉，引导用户看核心日志
+    echo "主日志: logs/run.log (按天切割)"
+    echo "错误日志: logs/err.log (仅记录真实报错)"
     echo ""
-    echo "查看实时日志: tail -f $MAIN_LOG"
+    echo "查看实时日志: tail -f logs/run.log"
     echo "停止爬虫: ./stop.sh"
     echo "查看状态: ./status.sh"
 else

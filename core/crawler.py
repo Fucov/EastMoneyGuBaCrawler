@@ -10,8 +10,7 @@ import logging
 from datetime import datetime
 
 # from retrying import retry
-from typing import Optional, Union
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 # from Utils.MongoClient import MongoClient
 # from Utils.EuclidDataTools import CsvClient
 # from TreadCrawler import RedisClient
@@ -21,6 +20,8 @@ from storage.database_client import DatabaseManager
 from core.user_agent_manager import get_user_agent_manager
 import time
 import random
+import threading
+import sys
 
 from tenacity import (
     retry,
@@ -28,7 +29,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-from pymongo.errors import DuplicateKeyError, BulkWriteError
+from pymongo.errors import BulkWriteError
 from core.proxy_manager import ProxyManager  # 使用统一的代理池管理器
 
 
@@ -162,14 +163,21 @@ class guba_comments:
         # log_format = "%(levelname)s %(asctime)s %(filename)s %(lineno)d %(message)s"
         # logging.basicConfig(filename=self.log_path, format=log_format, level=logging.INFO,encoding = 'utf-8')
 
-        # 设置日志级别为WARNING，减少刷屏（只显示警告和错误）
+        # 设置日志级别
+        log_level_str = config.get("logging", "log_level", fallback="INFO").upper()
+        log_level = getattr(logging, log_level_str, logging.INFO)
+
         self.logger = logging.getLogger(
             config.get("logging", "log_file", fallback="main_controller.log")
         )
-        if not self.logger.handlers:  # 避免重复添加handler
-            self.logger.setLevel(logging.WARNING)  # 只显示WARNING及以上级别
-            handler = logging.StreamHandler()
-            handler.setLevel(logging.WARNING)
+        if not self.logger.handlers:
+            self.logger.setLevel(log_level)
+            # 使用 sys.stdout 确保日志输出到 run.log (因为 start.sh 中 > run.log)
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setLevel(log_level)
+            # 设置该handler的格式
+            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
             self.logger.addHandler(handler)
 
         # User-Agent管理器初始化
@@ -179,16 +187,6 @@ class guba_comments:
         self.header = {
             "User-Agent": self.ua_manager.get_user_agent(),
         }
-
-        # # proxies setting
-        # if config.has_option("proxies", "tunnel"):
-        #     tunnel = config.get("proxies", "tunnel")
-        #     self.proxies = {
-        #         "http": "http://%(proxy)s/" % {"proxy": tunnel},
-        #         "https": "http://%(proxy)s/" % {"proxy": tunnel},
-        #     }
-        # else:
-        #     self.proxies = None
 
         # 隧道域名:端口号
         tunnel = "x291.kdltps.com:15818"
@@ -211,6 +209,7 @@ class guba_comments:
             min_proxy_threshold = config.getint(
                 "proxies", "min_proxy_count", fallback=5
             )
+            target_proxy_count = config.getint("proxies", "target_count", fallback=20)
 
             self.proxy_pool = ProxyManager(
                 redis_host=config.get("Redis", "host", fallback="localhost"),
@@ -220,14 +219,21 @@ class guba_comments:
                 cache_key=config.get(
                     "Redis", "proxy_cache_key", fallback="guba:proxies:valid"
                 ),
+                min_threshold=min_proxy_threshold,
+                target_count=target_proxy_count,
             )
-            # 尝试从文件加载
-            if not self.proxy_pool.load_from_file():
-                # 文件不存在，建立新池（每个源最多200个，全面测试，不限时间）
-                print("⏳ 开始全面代理测试，预计5-10分钟...")
-                self.proxy_pool.build_pool(max_workers=50, max_per_source=200)
-                self.proxy_pool.save_to_file()
-            print("✅ 代理池就绪\n")
+            # 如果代理池为空，异步启动补充，不要阻塞主流程
+            if self.proxy_pool.count() == 0:
+                print("⏳ 代理池为空，后台启动代理补充线程...")
+                threading.Thread(
+                    target=self.proxy_pool.build_pool,
+                    kwargs={"max_workers": 50, "max_per_source": 200},
+                    daemon=True,
+                ).start()
+            else:
+                current_count = self.proxy_pool.count()
+                print(f"✅ 代理池就绪 (当前可用: {current_count})")
+            print("")
 
         if proxy_enabled and not use_free_proxy_pool:
             # 使用配置文件中的固定代理
@@ -256,28 +262,6 @@ class guba_comments:
 
         self.use_backup_proxy = False
 
-    def _change_proxy_ip(self):
-        """调用快代理更换隧道IP接口"""
-        try:
-            import requests
-
-            change_url = "https://tps.kdlapi.com/api/changetpsip"
-            params = {
-                "secret_id": "oqifdb1h1ykoxm8comcv",
-                "signature": "vhp8ervln42dkh85ht3ijw6adctj1wah",
-            }
-
-            response = requests.get(change_url, params=params, timeout=3)
-            if response.status_code == 200:
-                self.logger.info("隧道IP更换成功")
-                return True
-            else:
-                self.logger.error(f"更换隧道IP失败，状态码: {response.status_code}")
-                return False
-        except Exception as e:
-            self.logger.error(f"更换隧道IP时发生异常: {e}")
-            return False
-
     @staticmethod
     def clear_str(str_raw):
         for pat in ["\n", " ", " ", "\r", "\xa0", "\n\r\n"]:
@@ -301,7 +285,9 @@ class guba_comments:
             content_type: 'news' (资讯) | 'report' (研报) | 'notice' (公告)
 
         Returns:
+            tuple: (total_pages, total_count)
             int: 总页数，如果检测失败返回0
+            int: 总条数，如果检测失败返回0
         """
         import re
         import math
@@ -311,342 +297,416 @@ class guba_comments:
 
         if content_type not in type_map:
             self.logger.error(f"未知的内容类型: {content_type}")
-            return 0
+            return 0, 0
 
         # 构造第一页URL
         url = f"https://guba.eastmoney.com/list,{self.secCode},{type_map[content_type]}.html"
 
-        try:
-            soup = self.get_soup_form_url(url)
-            if not soup:
-                return 0
+        max_retries = 5  # User requested 5 retries for this critical step
+        for attempt in range(max_retries):
+            try:
+                soup, proxy_used = self.get_soup_form_url(url)
+                if not soup:
+                    if attempt < max_retries - 1:
+                        time.sleep(random.uniform(1, 3))
+                        continue
+                    return 0, 0
 
-            # 查找所有script标签
-            scripts = soup.find_all("script")
+                # 查找所有script标签
+                scripts = soup.find_all("script")
 
-            for script in scripts:
-                script_text = script.string
-                if script_text and "var article_list" in script_text:
-                    # 找到包含 article_list 的脚本
-                    # 使用正则提取 "count": 数字
-                    match = re.search(r'"count"\s*:\s*(\d+)', script_text)
-                    if match:
-                        total_count = int(match.group(1))
+                # Flag to track if we found a "bad" result that necessitates a force retry
+                force_retry = False
 
-                        # 安全检查：如果count异常大，可能是服务器返回了错误数据
-                        if total_count > 50000:
+                for script in scripts:
+                    script_text = script.string
+                    if script_text and "var article_list" in script_text:
+                        # 找到包含 article_list 的脚本
+                        # 使用正则提取 "count": 数字
+                        match = re.search(r'"count"\s*:\s*(\d+)', script_text)
+                        if match:
+                            total_count = int(match.group(1))
+
+                            # 安全检查：如果count异常大，可能是服务器返回了错误数据
+                            if total_count > 50000:
+                                print(
+                                    f"⚠️ {content_type}: count值异常大({total_count})，可能被反爬虫，正在重试(Attempt {attempt + 1}/{max_retries})..."
+                                )
+                                # [新增] 对返回异常数据的IP进行扣分
+                                if (
+                                    self.proxy_pool
+                                    and proxy_used
+                                    and proxy_used.startswith("http")
+                                ):
+                                    self.logger.info(
+                                        f"🚫 对IP {proxy_used} 进行扣分处理"
+                                    )
+                                    self.proxy_pool.update_score(
+                                        proxy_used, success=False
+                                    )
+
+                                force_retry = True
+                                break  # Break from script loop to trigger outer retry
+
+                            # 每页80条，计算总页数
+                            total_pages = math.ceil(total_count / 80)
                             print(
-                                f"⚠️ {content_type}: count值异常大({total_count})，可能被反爬虫，使用保守值"
+                                f"✓ {content_type}: 共{total_count}条数据，{total_pages}页"
                             )
-                            return 1  # 返回1页，让用户察觉问题
+                            return total_pages, total_count
 
-                        # 每页80条，计算总页数
-                        total_pages = math.ceil(total_count / 80)
-                        print(
-                            f"✓ {content_type}: 共{total_count}条数据，{total_pages}页"
-                        )
-                        return total_pages
+                # Logic for retry:
+                # If we are here, it means either:
+                # 1. No script contained 'article_list'
+                # 2. 'article_list' was found but count was > 50000 (force_retry=True)
 
-            # 如果没找到JavaScript变量，回退到只返回1页
-            print(f"⚠️ {content_type}: 未找到article_list变量，默认1页")
-            return 1
+                if force_retry:
+                    # Log already printed above
+                    pass
+                else:
+                    print(
+                        f"⚠️ {content_type}: 未找到article_list变量 (Attempt {attempt + 1}/{max_retries})"
+                    )
 
-        except Exception as e:
-            print(f"❌ {content_type}: 检测页数异常 - {e}")
-            self.logger.error(f"检测{content_type}总页数失败: {e}")
-            return 0
+                if attempt < max_retries - 1:
+                    time.sleep(random.uniform(1, 3))
+                    continue
+                else:
+                    print(f"⚠️ {content_type}: 多次重试后均失败，默认1页")
+                    return 1, 0
 
-    def _infer_year_for_publish_time(self, publish_time_raw):
+            except Exception as e:
+                print(f"❌ {content_type}: 检测页数异常(第{attempt + 1}次) - {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(random.uniform(1, 3))
+                else:
+                    self.logger.error(f"检测{content_type}总页数失败: {e}")
+                    return 0, 0
+
+        return 0, 0
+
+    def get_soup_form_url(self, url: str) -> tuple[BeautifulSoup | None, str | None]:
         """
-        推断发布时间的年份
-
-        逻辑：
-        1. 解析出月份
-        2. 如果当前月份 > 上一条的月份+3（例如从1月到12月），说明跨年了，年份-1
-        3. 返回完整的年月日时间字符串
-
-        Args:
-            publish_time_raw: 原始时间字符串，例如 "01-21 15:30" 或 "12-31 23:59"
-
+        获取页面内容（内置IP轮换重试机制）
         Returns:
-            完整时间字符串，例如 "2026-01-21 15:30" 或 "2025-12-31 23:59"
+            (soup, proxy_url_str)
         """
-        try:
-            # 解析月份（例如："01-21 15:30" -> 1）
-            parts = publish_time_raw.split()
-            if len(parts) < 1:
-                return publish_time_raw
+        # Session should be created FRESH for each attempt if we want to simulate a completely new user
+        # However, if we want to reuse connections for the same proxy, it should be outside.
+        # Given the anti-crawl context (redirecting to other sites), a fresh session per attempt is safer
+        # to avoid carrying over any "flagged" cookies.
 
-            date_part = parts[0]  # "01-21"
-            month = int(date_part.split("-")[0])
+        # session = requests.Session() <--- MOVED INSIDE LOOP
 
-            # 推断年份逻辑
-            if self.last_month is not None:
-                # 如果当前月份 > 上一条月份+3，说明跨年反向了（例如：1月 -> 12月）
-                if month > self.last_month + 3:
-                    self.current_year -= 1
-
-            self.last_month = month
-
-            # 拼接完整时间
-            return f"{self.current_year}-{publish_time_raw}"
-
-        except Exception as e:
-            # 如果解析失败，返回原始字符串
-            return publish_time_raw
-
-    # @retry(stop_max_attempt_number=5, wait_fixed=2000)  # 最多尝试5次，每次间隔2秒
-    def get_soup_form_url(self, url: str) -> BeautifulSoup:
-        session = requests.Session()
         current_headers = {
             "User-Agent": self.ua_manager.get_user_agent(),
             "Referer": f"https://guba.eastmoney.com/list,{self.secCode}.html",
             "Connection": "keep-alive",
         }
 
-        proxies_to_use = None
-        if self.proxy_pool:
-            proxies_to_use = self.proxy_pool.get_random_proxy()
-            if not proxies_to_use:
-                # 关键：如果启用了池但拿不到代理，抛错防止泄露本地IP
-                raise NetworkException("代理池已空，为保护本地IP，停止请求")
-        elif self.proxies:
-            proxies_to_use = (
-                self.backup_proxies if self.use_backup_proxy else self.proxies
-            )
+        # 内置重试循环：尝试3个不同的代理
+        for attempt in range(1, 4):
+            # Create a fresh session for each attempt to avoid cookie tracking across proxies
+            session = requests.Session()
 
-        try:
-            response = session.get(
-                url,
-                headers=current_headers,
-                timeout=5,  # 缩短超时到5秒
-                proxies=proxies_to_use,
-            )
-            session.close()
+            proxies_to_use = None
+            proxy_url_str = "Direct"
 
-            if response.status_code != 200:
-                # 如果是403或502，说明代理被封或失效
+            if self.proxy_pool:
+                proxies_to_use = self.proxy_pool.get_random_proxy()
+                if not proxies_to_use:
+                    # 代理池空了，抛错
+                    # Close session before raising
+                    session.close()
+                    raise NetworkException("代理池耗尽")
+                proxy_url_str = proxies_to_use.get("http", "Unknown")
+
+            elif self.proxies:
+                proxies_to_use = (
+                    self.backup_proxies if self.use_backup_proxy else self.proxies
+                )
+                proxy_url_str = "ConfigProxy"
+
+            try:
+                # self.logger.info(f"下载尝试 {attempt}/3: {url} (IP: {proxy_url_str})")
+                response = session.get(
+                    url,
+                    headers=current_headers,
+                    timeout=10,  # 稍微放宽超时到10秒
+                    proxies=proxies_to_use,
+                )
+
+                if response.status_code != 200:
+                    self.logger.warning(
+                        f"请求失败 [{response.status_code}] (IP: {proxy_url_str})"
+                    )
+                    if self.proxy_pool and proxies_to_use:
+                        self.proxy_pool.remove_proxy(proxies_to_use)
+                    session.close()  # Close failed session
+                    continue
+
+                html = response.content.decode("utf-8", "ignore")
+
+                # 简单内容校验
+                if "listitem" not in html:
+                    if "验证" in html or "captcha" in html:
+                        self.logger.warning(f"触发反爬虫验证 (IP: {proxy_url_str})")
+                        if self.proxy_pool:
+                            self.proxy_pool.remove_proxy(proxies_to_use)
+                        session.close()
+                        continue
+
+                    # 正常返回200但无内容，可能是最后一页，也可能是代理被软封锁
+                    # 策略：不扣分，不移除代理，但算作一次失败（continue尝试其他代理）
+                    # User Modified: "如果为空不应该给ip扣分（目标网站的反爬只有两个策略：非200错误，或者导航到其他的网站）"
+                    # So we just continue to try another proxy if this one returned weird empty data,
+                    # but we do NOT remove it from the pool.
+                    self.logger.info(
+                        f"页面无内容 (IP: {proxy_url_str})，重试下一个代理"
+                    )
+                    # Close session and continue
+                    session.close()
+                    continue
+
+                session.close()
+                return BeautifulSoup(html, features="lxml"), proxy_url_str
+
+            except Exception as e:
+                # 发生网络错误
+                self.logger.warning(f"网络异常: {e} (IP: {proxy_url_str})")
                 if self.proxy_pool and proxies_to_use:
                     self.proxy_pool.remove_proxy(proxies_to_use)
-                return None
+                session.close()
+                continue
 
-            html = response.content.decode("utf-8", "ignore")
-            if "listitem" not in html:
-                if "验证" in html or "captcha" in html:
-                    if self.proxy_pool:
-                        self.proxy_pool.remove_proxy(proxies_to_use)
-                return None
-            return BeautifulSoup(html, features="lxml")
+        # session.close() # Removed because session is now local in loop and closed there
+        return None, None
 
-        except Exception as e:
-            # 发生任何网络错误，立即移除该代理
-            if self.proxy_pool and proxies_to_use:
-                self.proxy_pool.remove_proxy(proxies_to_use)
-            self.logger.warning(f"代理请求异常: {e}")
-            return None
-
-    def get_data_json(self, item, content_type="news"):
-        """
-        解析数据项，支持三种内容类型
-
-        Args:
-            item: BeautifulSoup元素
-            content_type: 'news' (资讯) | 'report' (研报) | 'notice' (公告)
-
-        Returns:
-            dict: 数据字典，解析失败返回None
-        """
-
-        tds = item.find_all("td")
-        if len(tds) < 5:
-            # 静默跳过，不打印警告
-            return None
-
-        try:
-            # 提取URL和ID
-            href = tds[2].a["href"]
-            full_url = "https://guba.eastmoney.com" + href
-
-            # 从URL中提取唯一ID（例如：/news,600519,1234567890.html -> 1234567890）
-            try:
-                url_id = href.split(",")[-1].replace(".html", "").strip()
-            except:
-                url_id = href  # 如果提取失败，使用完整href
-
-            # 数字字段转换
-            try:
-                read_count = int(tds[0].text.strip())
-            except:
-                read_count = 0
-
-            try:
-                comment_count = int(tds[1].text.strip())
-            except:
-                comment_count = 0
-
-            # 根据内容类型解析特定字段
-            author = None
-            grade = None
-            institution = None
-            notice_type = None
-            publish_time_raw = ""
-
-            if content_type == "news":
-                # 资讯：第4列是作者，第5列是时间
-                try:
-                    author = tds[3].a.text.strip() if tds[3].a else None
-                except:
-                    author = None
-                publish_time_raw = tds[4].text.strip()
-
-            elif content_type == "report":
-                # 研报：第4列是评级，第5列是机构，第6列是时间
-                try:
-                    grade = tds[3].text.strip() if len(tds) > 3 else None
-                    institution = tds[4].text.strip() if len(tds) > 4 else None
-                    publish_time_raw = tds[5].text.strip() if len(tds) > 5 else ""
-                except:
-                    grade = None
-                    institution = None
-                    publish_time_raw = ""
-
-            elif content_type == "notice":
-                # 公告：第4列是公告类型，第5列是时间
-                try:
-                    notice_type = tds[3].text.strip() if len(tds) > 3 else None
-                    publish_time_raw = tds[4].text.strip() if len(tds) > 4 else ""
-                except:
-                    notice_type = None
-                    publish_time_raw = ""
-
-            # 解析publish_time并推断年份
-            publish_time_with_year = self._infer_year_for_publish_time(publish_time_raw)
-
-            # 新的规范化字段结构
-            data_json = {
-                "stock_code": self.secCode,  # 股票代码
-                "content_type": content_type,  # 内容类型
-                "title": tds[2].a.text.strip(),  # 标题
-                "url": full_url,  # 完整URL
-                "url_id": url_id,  # URL唯一ID
-                "read_count": read_count,  # 阅读数（数字）
-                "comment_count": comment_count,  # 评论数（数字）
-                "publish_time": publish_time_with_year,  # 发布时间（带年份）
-                "author": author,  # 作者（仅资讯）
-                "grade": grade,  # 评级（仅研报）
-                "institution": institution,  # 机构（仅研报）
-                "notice_type": notice_type,  # 公告类型（仅公告）
-                "summary": tds[2].a.text.strip()[:100],  # 摘要（标题前100字）
-                "crawl_time": datetime.now(),  # 爬取时间
-                "source": "official",  # 来源标识
-                "created_at": datetime.now(),  # 创建时间
-                "updated_at": datetime.now(),  # 更新时间
-            }
-            return data_json
-
-        except Exception as e:
-            # 静默跳过解析失败的数据
-            return None
-
-        return data_json
+    # --- get_data is below ---
 
     @retry(
         retry=(
             retry_if_exception_type(NetworkException)
             | retry_if_exception_type(ServerException)
-            # retry_if_exception(lambda e: isinstance(e, ContentChangedException))
+            | retry_if_exception_type(ContentChangedException)
         ),
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=4),
     )
-    def get_data(self, page, content_type="news"):
+    def get_data(self, page, content_type="news", expected_total_count=None):
         """
-        获取指定页面的数据
+        获取指定页面的数据 - 统一JSON解析版
+        支持 news, report, notice 三种类型
+        """
+        import re
+        import json
+        from datetime import datetime, timedelta, timezone
 
-        Args:
-            page: 页码
-            content_type: 'news' (资讯) | 'report' (研报) | 'notice' (公告)
-        """
+        # 北京时间工具
+        def get_beijing_now():
+            tz_beijing = timezone(timedelta(hours=8))
+            return datetime.now(tz_beijing)
+
         # 类型映射
         type_map = {"news": "1,f", "report": "2,f", "notice": "3,f"}
 
-        # 正确的官方资讯/研报/公告URL格式
+        # 构造URL
         if page == 1:
             Url = f"https://guba.eastmoney.com/list,{self.secCode},{type_map[content_type]}.html"
         else:
             type_prefix = type_map[content_type]
             Url = f"https://guba.eastmoney.com/list,{self.secCode},{type_prefix}_{page}.html"
-        data_list = None
 
         try:
             self.logger.info(f"开始处理页面 {Url}")
 
-            soup = self.get_soup_form_url(Url)
+            soup, _ = self.get_soup_form_url(Url)
             if soup is None:
-                raise NetworkException(f"无法获取页面 {page}")
+                raise NetworkException(f"无法获取页面 {page} (soup is None)")
 
-            data_list = soup.find_all("tr", "listitem")
-            if not data_list:
-                raise NetworkException(f"页面 {page} 无数据")
+            # 1. 提取 JSON 数据
+            # 查找包含 var article_list 的脚本
+            scripts = soup.find_all("script")
+            article_list_data = None
 
-            new_insert_count = 0
+            for script in scripts:
+                script_text = script.string
+                if script_text and "var article_list" in script_text:
+                    try:
+                        # 使用 raw_decode 解决 "Extra data" 问题
+                        # 只需要找到开始的 '{'
+                        start_index = script_text.find("{")
+                        if start_index != -1:
+                            decoder = json.JSONDecoder()
+                            # raw_decode 会从字符串开头解析一个完整的JSON对象，并返回 (obj, end_index)
+                            # 我们传入从 '{' 开始的字符串
+                            article_list_data, _ = decoder.raw_decode(
+                                script_text[start_index:]
+                            )
+                            break
+                    except Exception as e:
+                        # self.logger.warning(f"JSON解析尝试失败: {e}")
+                        # 降低日志级别，只有Debug才显示，避免刷屏
+                        continue
+
+            # 2. 校验数据有效性
+            if not article_list_data or "re" not in article_list_data:
+                if "没有相关数据" in str(soup):
+                    return []
+
+                if "验证" in str(soup):
+                    raise ContentChangedException("页面包含验证信息，需要重试")
+
+                # 如果找不到数据，可能是反爬或者页面变更
+                raise NetworkException(
+                    f"页面 {page} 未找到有效的 article_list JSON数据"
+                )
+
+            # 3. 反爬虫校验 (检查 count)
+            if expected_total_count and expected_total_count > 0:
+                page_count = article_list_data.get("count", 0)
+                if abs(page_count - expected_total_count) > 100:
+                    self.logger.warning(
+                        f"⚠️ 反爬虫警告: 页面{page} count({page_count}) 与预期({expected_total_count}) 差异过大"
+                    )
+                    raise ContentChangedException(
+                        f"页面内容不匹配 (Count deviation: {page_count} vs {expected_total_count})"
+                    )
+
+            # 4. 解析数据列表
+            items = article_list_data["re"]
             batch_data = []
 
-            for item in data_list:
-                data_json = self.get_data_json(item, content_type)
-                if data_json:
+            for item in items:
+                try:
+                    post_id = str(item.get("post_id"))
+                    title = item.get("post_title")
+
+                    if not post_id or not title:
+                        continue
+
+                    # 统一URL处理
+                    raw_url = item.get("Art_Url")
+                    if raw_url:
+                        url = raw_url
+                    else:
+                        url = f"https://guba.eastmoney.com/news,{self.secCode},{post_id}.html"
+
+                    # 统一构建数据字典
+                    data_json = {
+                        "stock_code": self.secCode,
+                        "content_type": content_type,
+                        "title": title,
+                        "url": url,
+                        "url_id": post_id,
+                        "read_count": item.get("post_click_count", 0),
+                        "comment_count": item.get("post_comment_count", 0),
+                        "publish_time": item.get("post_publish_time"),  # 完整时间
+                        # Author / Nickname
+                        "author": item.get("user_nickname"),
+                        # Report Specific
+                        "grade": item.get("grade_type"),  # 评级
+                        "institution": item.get("institution"),  # 机构
+                        # Notice Specific
+                        "notice_type": item.get("notice_type"),  # 公告类型
+                        "summary": title,
+                        "source": "official",
+                        "created_at": get_beijing_now(),
+                        "updated_at": get_beijing_now(),
+                    }
+
                     batch_data.append(data_json)
+                except Exception as e:
+                    self.logger.warning(f"解析条目失败: {e}")
+                    continue
 
-            if not batch_data:
-                return 0
+            self.logger.info(f"成功获取页面 {page}: {len(batch_data)} 条数据")
+            return batch_data
 
-            # 使用 unordered 批量插入，速度更快且会自动跳过重复 ID
-            try:
-                # 这里的 self.col 是 pymongo collection 对象
-                result = self.col.insert_many(batch_data, ordered=False)
-                new_insert_count = len(result.inserted_ids)
-            except BulkWriteError as e:
-                # 部分插入成功，部分因重复 ID 失败
-                new_insert_count = e.details.get("nInserted", 0)
-            except Exception as e:
-                self.logger.error(f"批量写入异常: {e}")
-
-            return new_insert_count
+        except ContentChangedException as e:
+            raise e  # 直接抛出，触发retry
         except Exception as e:
             time.sleep(random.uniform(0.5, 3))
-            self.logger.error(f"soup数据转data_list失败: {e}")
+            self.logger.error(f"获取页面数据失败: {e}")
             raise NetworkException(e)
 
     # 检查索引存在性
     def index_exists_by_name(self, collection, index_name):
         return index_name in collection.index_information()
 
-    def _crawl_single_page(self, page: int, content_type: str) -> int:
+    def _crawl_single_page(
+        self, page: int, content_type: str, total_count: int
+    ) -> list:
         """
         线程池使用的单页爬取包装方法
-
-        Args:
-            page: 页码
-            content_type: 内容类型
-
-        Returns:
-            新增数据条数，-1表示达到重复阈值
+        增加逻辑：针对最后一页（或接近末尾页）可能为空的情况进行特殊处理
+        返回 None 表示失败，返回 [] 表示成功但无数据
         """
         retry_count = 0
-        max_retries = 5
+        max_retries = 3  # 默认网络重试
+        empty_retries = 0  # 空数据重试
+
+        # 判断是否可能是最后一页 (每页80条)
+        is_last_page = False
+        if total_count > 0:
+            if page * 80 >= total_count:
+                is_last_page = True
 
         while retry_count < max_retries:
             try:
-                new_count = self.get_data(page, content_type)
-                return new_count
+                # 只负责下载
+                data_list = self.get_data(
+                    page, content_type, expected_total_count=total_count
+                )
+
+                # [新增] 针对最后一页为空的BUG处理 (数据为空的情况)
+                if not data_list and is_last_page:
+                    if empty_retries < 2:
+                        empty_retries += 1
+                        time.sleep(1)
+                        self.logger.info(
+                            f"页面{page} (最后一页?) 返回数据空，重试第{empty_retries}次..."
+                        )
+                        continue  # 触发重试
+                    else:
+                        self.logger.info(
+                            f"页面{page} (最后一页) 连续为空，视为正常结束 (网站BUG)"
+                        )
+                        return []  # explicitly return empty list for success
+
+                return data_list
+
+            except NetworkException as e:
+                # [新增] 专门处理 "soup is None" 这种情况
+                if is_last_page and "soup is None" in str(e):
+                    if empty_retries < 2:
+                        empty_retries += 1
+                        time.sleep(1)
+                        self.logger.info(
+                            f"页面{page} (最后一页?) 获取为空(soup=None)，重试第{empty_retries}次..."
+                        )
+                        continue
+                    else:
+                        self.logger.info(
+                            f"页面{page} (最后一页) 连续获取为空，视为正常结束"
+                        )
+                        return []
+
+                # 其他网络错误，走正常重试
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self.logger.error(f"页面{page}重试{max_retries}次后仍失败: {e}")
+                    return None  # Failure
+                time.sleep(random.uniform(1, 2))
+
             except Exception as e:
                 retry_count += 1
                 if retry_count >= max_retries:
                     self.logger.error(f"页面{page}重试{max_retries}次后仍失败: {e}")
-                    return 0
+                    return None  # Failure
                 time.sleep(random.uniform(1, 2))
 
-        return 0
+        return None  # Failure if loop finishes without return
 
     def main(self):
         # 创建复合唯一索引：stock_code + content_type + url_id
@@ -674,13 +734,9 @@ class guba_comments:
         content_types = ["news", "report", "notice"]
         type_names = {"news": "资讯", "report": "研报", "notice": "公告"}
 
-        # 爬取前预检代理池已移除（由scheduler统一管理）
-        # if self.proxy_manager:
-        #     self.proxy_manager.revalidate_pool()
-
         for content_type in content_types:
-            # 自动检测总页数
-            total_pages = self.get_total_pages(content_type)
+            # 自动检测总页数和总条数
+            total_pages, total_count = self.get_total_pages(content_type)
 
             if total_pages == 0:
                 print(f"⚠️ 无法获取{type_names[content_type]}页数，跳过")
@@ -696,13 +752,24 @@ class guba_comments:
             self.current_year = datetime.now().year
 
             # 爬取所有页面 - 多线程版本
-            page_results = {}  # 存储每页的爬取结果
+            # 这里的改变是：多线程下载，但单线程顺序处理结果（入库）
 
-            # 使用线程池并发爬取
+            # [新增] 记录IP池健康状况
+            if self.proxy_pool:
+                pool_size = self.proxy_pool.count()
+                self.logger.info(f"当前IP池健康状况: {pool_size}个可用代理")
+                if pool_size < 5:
+                    self.logger.warning(
+                        f"⚠️ IP池数量较低 ({pool_size})，爬取速度可能受限"
+                    )
+
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # 提交所有页面任务
-                future_to_page = {
-                    executor.submit(self._crawl_single_page, page, content_type): page
+                # page -> future
+                future_map = {
+                    page: executor.submit(
+                        self._crawl_single_page, page, content_type, total_count
+                    )
                     for page in range(1, total_pages + 1)
                 }
 
@@ -710,73 +777,81 @@ class guba_comments:
                 with tqdm(
                     total=total_pages, desc=f"{type_names[content_type]}"
                 ) as pbar:
-                    # 按页面顺序处理结果（用于检测连续重复）
-                    completed = 0
                     should_stop = False
 
-                    for future in as_completed(future_to_page):
-                        page = future_to_page[future]
+                    # 严格按顺序 1, 2, 3... 获取结果
+                    for page in range(1, total_pages + 1):
+                        future = future_map[page]
                         try:
-                            new_count = future.result()
-                            page_results[page] = new_count
+                            # 获取结果（如果该页还没下载完，会阻塞直到下载完）
+                            batch_data = future.result()
 
-                            # 页级重复检测逻辑
+                            # [新增] 如果返回None，说明该页爬取失败（重试耗尽），跳过处理，不计入重复停止逻辑
+                            if batch_data is None:
+                                self.logger.error(f"页面 {page} 最终失败，跳过处理")
+                                pbar.update(1)
+                                continue
+
+                            # 1. 顺序处理 (JSON解析模式下不需要推断年份)
+                            valid_data = []
+                            for data in batch_data:
+                                # JSON直接返回完整时间，无需推断
+                                # data["publish_time"] 已经是 "2026-01-19 19:02:17" 格式
+                                valid_data.append(data)
+
+                            # 2. 写入数据库
+                            new_count = 0
+                            if valid_data:
+                                try:
+                                    result = self.col.insert_many(
+                                        valid_data, ordered=False
+                                    )
+                                    new_count = len(result.inserted_ids)
+                                except BulkWriteError as e:
+                                    new_count = e.details.get("nInserted", 0)
+                                except Exception as e:
+                                    self.logger.error(f"写入DB失败: {e}")
+
+                            # 3. 页级重复检测
                             if new_count == 0:
                                 self.consecutive_duplicate_pages += 1
                                 pbar.set_postfix(
                                     {
                                         "新增": 0,
-                                        "状态": f"已同步 (连续{self.consecutive_duplicate_pages}页重复)",
+                                        "状态": f"页重复x{self.consecutive_duplicate_pages}",
                                     }
                                 )
                             else:
-                                self.consecutive_duplicate_pages = 0  # 重置计数器
+                                self.consecutive_duplicate_pages = 0
                                 pbar.set_postfix({"新增": new_count, "状态": "进行中"})
 
-                            # 检查是否达到阈值（连续2页全为重复）
+                            # 4. 阈值检查
                             if (
                                 self.consecutive_duplicate_pages
                                 >= self.duplicate_page_threshold
                             ):
                                 self.logger.warning(
-                                    f"⏹ 连续{self.consecutive_duplicate_pages}页无新数据，"
-                                    f"已达到阈值({self.duplicate_page_threshold})，"
-                                    f"跳过{self.secCode}的{type_names[content_type]}栏目"
-                                )
-                                pbar.set_postfix(
-                                    {
-                                        "状态": f"跳过（连续{self.consecutive_duplicate_pages}页重复）"
-                                    }
+                                    f"⏹ 连续{self.consecutive_duplicate_pages}页重复，跳过剩余"
                                 )
                                 should_stop = True
 
                             pbar.update(1)
-                            completed += 1
 
-                            # 如果需要停止，取消剩余任务
                             if should_stop:
-                                for f in future_to_page:
-                                    if not f.done():
-                                        f.cancel()
+                                # 取消剩余任务
+                                for p in range(page + 1, total_pages + 1):
+                                    if p in future_map:
+                                        future_map[p].cancel()
                                 break
 
                         except Exception as e:
-                            self.logger.error(f"页面{page}爬取失败: {e}")
+                            self.logger.error(f"处理页面{page}流程失败: {e}")
                             pbar.update(1)
 
-                    # 如果提前终止，更新进度条到结束
-                    if should_stop and completed < total_pages:
-                        pbar.update(total_pages - completed)
-
-            # 输出本栏目结果
             if should_stop:
-                print(
-                    f"\n⏹️ {self.secCode} {type_names[content_type]} 因连续重复提前终止"
-                )
+                print(f"\n⏹️ {self.secCode} {type_names[content_type]} 提前结束")
             else:
-                print(
-                    f"\n✓ {self.secCode} {type_names[content_type]} 完成，共爬取{len(page_results)}页"
-                )
+                print(f"\n✓ {self.secCode} {type_names[content_type]} 完成")
 
             time.sleep(random.uniform(0, 1))
             self.num_start = 0

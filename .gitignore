@@ -1,0 +1,5 @@
+.DS_Store
+.idea/*
+*.html
+*.log
+.crawler.pid

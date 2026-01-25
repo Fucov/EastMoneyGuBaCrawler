@@ -43,16 +43,16 @@ fi
 echo -e "\n${BLUE}[日志文件]${NC}"
 if [ -d "$LOG_DIR" ]; then
     # 最新的主日志
-    LATEST_MAIN_LOG=$(ls -t $LOG_DIR/crawler_*.log 2>/dev/null | head -1)
-    if [ -n "$LATEST_MAIN_LOG" ]; then
+    LATEST_MAIN_LOG="$LOG_DIR/run.log"
+    if [ -f "$LATEST_MAIN_LOG" ]; then
         LOG_SIZE=$(du -h "$LATEST_MAIN_LOG" | cut -f1)
         echo "最新主日志: $(basename $LATEST_MAIN_LOG) ($LOG_SIZE)"
         echo "  路径: $LATEST_MAIN_LOG"
     fi
     
     # 最新的错误日志
-    LATEST_ERROR_LOG=$(ls -t $LOG_DIR/error_*.log 2>/dev/null | head -1)
-    if [ -n "$LATEST_ERROR_LOG" ]; then
+    LATEST_ERROR_LOG="$LOG_DIR/err.log"
+    if [ -f "$LATEST_ERROR_LOG" ]; then
         ERROR_SIZE=$(du -h "$LATEST_ERROR_LOG" | cut -f1)
         ERROR_LINES=$(wc -l < "$LATEST_ERROR_LOG" 2>/dev/null || echo "0")
         echo "最新错误日志: $(basename $LATEST_ERROR_LOG) ($ERROR_SIZE, $ERROR_LINES行)"
@@ -85,14 +85,26 @@ fi
 # 4. MongoDB数据库状态
 echo -e "\n${BLUE}[数据库状态]${NC}"
 if command -v python > /dev/null 2>&1; then
-    DOC_COUNT=$(python -c "
+    DOC_COUNT=$(python3 -c "
+import sys
+import os
+import configparser
+sys.path.append(os.getcwd())
 try:
-    from database_client import DatabaseManager
-    db = DatabaseManager('config/settings.ini')
-    client = db.get_mongo_client('xiaoyi_db', 'stock_news')
-    print(client.count_documents())
-except:
-    print('无法连接')
+    from storage.database_client import DatabaseManager
+    # 读取配置
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    db_name = config.get('MongoDB', 'database', fallback='EastMoneyGubaNews')
+    col_name = config.get('mainClass', 'collectionName', fallback='stock_news')
+    
+    # 连接
+    db = DatabaseManager('config.ini')
+    client = db.get_mongo_client(db_name, col_name)
+    # 使用 count_documents({}) 统计
+    print(client.collection.count_documents({}))
+except Exception as e:
+    print(f'无法连接: {e}')
 " 2>/dev/null)
     echo "文档数: $DOC_COUNT"
 else
