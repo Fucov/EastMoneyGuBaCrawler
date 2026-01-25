@@ -221,6 +221,7 @@ class guba_comments:
                 ),
                 min_threshold=min_proxy_threshold,
                 target_count=target_proxy_count,
+                context=self.secCode,
             )
             # 如果代理池为空，仅提示，不启动线程（由Scheduler统一管理）
             if self.proxy_pool.count() == 0:
@@ -284,8 +285,8 @@ class guba_comments:
             int: 总页数，如果检测失败返回0
             int: 总条数，如果检测失败返回0
         """
-        import re
         import math
+        # import re  <-- Removed unused import
 
         # 类型映射
         type_map = {"news": "1,f", "report": "2,f", "notice": "3,f"}
@@ -317,38 +318,65 @@ class guba_comments:
                     script_text = script.string
                     if script_text and "var article_list" in script_text:
                         # 找到包含 article_list 的脚本
-                        # 使用正则提取 "count": 数字
-                        match = re.search(r'"count"\s*:\s*(\d+)', script_text)
-                        if match:
-                            total_count = int(match.group(1))
+                        # [Refactor] 校验逻辑变更：不再检查count, 而是检查user_nickname后缀
+                        try:
+                            import json
 
-                            # 安全检查：如果count异常大，可能是服务器返回了错误数据
-                            if total_count > 50000:
-                                print(
-                                    f"⚠️ {content_type}: count值异常大({total_count})，可能被反爬虫，正在重试(Attempt {attempt + 1}/{max_retries})..."
+                            # Use raw_decode to parse the JSON object starting from '{'
+                            start_index = script_text.find("{")
+                            if start_index != -1:
+                                decoder = json.JSONDecoder()
+                                article_list_data, _ = decoder.raw_decode(
+                                    script_text[start_index:]
                                 )
-                                # [新增] 对返回异常数据的IP进行扣分
-                                if (
-                                    self.proxy_pool
-                                    and proxy_used
-                                    and proxy_used.startswith("http")
-                                ):
-                                    self.logger.info(
-                                        f"🚫 对IP {proxy_used} 进行扣分处理"
-                                    )
-                                    self.proxy_pool.update_score(
-                                        proxy_used, success=False
-                                    )
 
-                                force_retry = True
-                                break  # Break from script loop to trigger outer retry
+                                # Extract items list
+                                items = article_list_data.get("re", [])
+                                if items:
+                                    # Check if ALL items have user_nickname ending with "资讯"
+                                    # Note: We need to be careful if the list is empty, but if it has items, check them.
+                                    # If list is empty, maybe it's valid (no news), or maybe invalid.
+                                    # Assuming if we get data, we validate it.
 
-                            # 每页80条，计算总页数
-                            total_pages = math.ceil(total_count / 80)
-                            print(
-                                f"✓ {content_type}: 共{total_count}条数据，{total_pages}页"
-                            )
-                            return total_pages, total_count
+                                    invalid_nicknames = []
+                                    for item in items:
+                                        nickname = item.get("user_nickname", "")
+                                        if not nickname.endswith("资讯"):
+                                            invalid_nicknames.append(nickname)
+
+                                    if invalid_nicknames:
+                                        print(
+                                            f"⚠️ {content_type}: 发现非'资讯'结尾的昵称 ({invalid_nicknames[:3]}...), 可能被反爬虫，正在重试(Attempt {attempt + 1}/{max_retries})..."
+                                        )
+                                        # [Repetitive Logic] Penalize IP
+                                        if (
+                                            self.proxy_pool
+                                            and proxy_used
+                                            and proxy_used.startswith("http")
+                                        ):
+                                            self.logger.info(
+                                                f"🚫 对IP {proxy_used} 进行扣分处理"
+                                            )
+                                            self.proxy_pool.update_score(
+                                                proxy_used, success=False
+                                            )
+
+                                        force_retry = True
+                                        break  # Break from script loop to trigger outer retry
+
+                                # extracting count for total_pages calculation
+                                total_count = int(article_list_data.get("count", 0))
+
+                                # 每页80条，计算总页数
+                                total_pages = math.ceil(total_count / 80)
+                                print(
+                                    f"✓ {content_type}: 校验通过 (昵称后缀检查)，共{total_count}条数据，{total_pages}页"
+                                )
+                                return total_pages, total_count
+
+                        except Exception as e:
+                            print(f"⚠️ {content_type}: JSON解析或校验失败: {e}")
+                            continue
 
                 # Logic for retry:
                 # If we are here, it means either:
@@ -622,8 +650,8 @@ class guba_comments:
             raise e  # 直接抛出，触发retry
         except Exception as e:
             time.sleep(random.uniform(0.5, 3))
-            self.logger.error(f"获取页面数据失败: {e}")
-            raise NetworkException(e)
+            self.logger.error(f"获取页面数据失败: {e}, 直接跳过该页面！")
+            # raise NetworkException(e)
 
     # 检查索引存在性
     def index_exists_by_name(self, collection, index_name):
@@ -778,8 +806,10 @@ class guba_comments:
                 }
 
                 # 使用tqdm显示进度
+                # [Request] Add stock code to tqdm description for err.log clarity
                 with tqdm(
-                    total=total_pages, desc=f"{type_names[content_type]}"
+                    total=total_pages,
+                    desc=f"[{self.secCode}] {type_names[content_type]}",
                 ) as pbar:
                     should_stop = False
 

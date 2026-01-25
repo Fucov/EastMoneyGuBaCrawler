@@ -32,6 +32,7 @@ class ProxyManager:
         target_url="https://guba.eastmoney.com/list,000001,1,f.html",
         min_threshold=5,
         target_count=20,
+        context=None,
     ):
         """
         初始化代理管理器
@@ -53,6 +54,7 @@ class ProxyManager:
         self.timeout = 3
         self.min_threshold = min_threshold
         self.target_count = target_count
+        self.context = context
 
         # 代理源配置
         self.sources = [
@@ -143,7 +145,10 @@ class ProxyManager:
             total = self.count()
             # 用户要求: error.log记录新增IP详情
             # 写入stderr并flush，确保进入err.log (由start.sh定义)
-            sys.stderr.write(f"➕ [IP新增] {proxy_url} (分值:{score}, 总数:{total})\n")
+            prefix = f"[{self.context}] " if self.context else ""
+            sys.stderr.write(
+                f"{prefix}➕ [IP新增] {proxy_url} (分值:{score}, 总数:{total})\n"
+            )
             sys.stderr.flush()
 
     def remove_proxy(self, proxy_dict: Dict):
@@ -255,13 +260,36 @@ class ProxyManager:
                 if "var article_list" not in content:
                     return None
 
-                match = re.search(r'"count"\s*:\s*(\d+)', content)
-                if match:
-                    count = int(match.group(1))
-                    if count > 50000:
-                        # self.logger.debug(f"⚠️ {proxy_url} 返回异常count({count})")
+                # [Refactor] 校验逻辑变更：不再检查count, 而是检查user_nickname后缀
+                try:
+                    import json
+
+                    # content is already decoded string
+                    start_index = content.find("var article_list")
+                    start_json = content.find("{", start_index)
+
+                    if start_json != -1:
+                        decoder = json.JSONDecoder()
+                        article_list_data, _ = decoder.raw_decode(content[start_json:])
+
+                        items = article_list_data.get("re", [])
+                        # 如果没有items, 暂时认为它是有效的（可能是因为没有数据），或者无效？
+                        # 原逻辑是必须有count字段。这里我们还是要求解析成功。
+                        # 如果有数据，必须满足昵称规则。
+                        if items:
+                            for item in items:
+                                nickname = item.get("user_nickname", "")
+                                if not nickname.endswith("资讯"):
+                                    # self.logger.debug(f"⚠️ {proxy_url} 返回异常昵称 ({nickname})")
+                                    return None
+
+                        # 确保解析正常
+                        if "count" not in article_list_data:
+                            return None
+                    else:
                         return None
-                else:
+
+                except Exception:
                     return None
 
                 score = max(100 - int(response_time * 20), 50)
