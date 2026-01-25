@@ -1,321 +1,102 @@
-# 东方财富股吧爬虫 - 生产系统 v2.0
-
-生产级24小时持续爬虫系统，自动爬取所有A股的资讯、研报、公告数据
-
-## ✨ 特性
-
-- **24小时持续运行** - 自动循环爬取，无需人工干预
-- **智能IP管理** - Redis缓存代理，低于阈值自动补充
-- **AkShare集成** - 自动获取所有A股代码（~5000只）
-- **多线程并发** - 12线程并发，充分利用代理池
-- **完整日志** - 按天切割，错误单独记录
-- **数据持久化** - MongoDB存储，统一Collection
-
-## 📁 项目结构
-
-```
-Guba-Crawler/
-├── config/
-│   └── settings.ini          # 统一配置文件
-├── core/
-│   ├── scheduler.py          # 24h调度器
-│   ├── stock_loader.py       # AkShare股票加载
-│   └── proxy_manager.py      # Redis代理管理
-├── storage/
-│   ├── logger.py             # 日志系统
-│   └── database.py           # 数据库客户端
-├── logs/                     # 日志目录
-│   ├── crawler.log           # 爬虫日志
-│   ├── scheduler.log         # 调度日志
-│   └── error.log             # 错误日志
-├── main.py                   # 主入口
-├── proxy_pool.py             # 原代理池（兼容）
-├── main_class.py             # 爬虫核心（待集成）
-└── full_text_CrawlerAsync.py # 全文爬虫（保留）
-```
-
-## 🚀 快速开始
-
-### 1. 环境准备
-
-```bash
-# 安装依赖
-pip install pymongo redis akshare requests beautifulsoup4 lxml tqdm tenacity
-
-# 启动Redis（无密码）
-redis-server
-```
-
-### 2. 配置文件
-
-编辑 `config/settings.ini`：
-
-```ini
-[MongoDB]
-host = 10.139.197.213
-database = xiaoyi_db
-
-[Redis]
-host = localhost
-port = 6379
-password =              # 本地无密码
-
-[Proxy]
-min_count = 5          # IP低于此值自动补充
-target_count = 20      # 补充到此数量
-
-[Crawler]
-max_workers = 12       # 并发线程数
-
-[Scheduler]
-mode = continuous      # continuous=24h运行 | once=单次
-interval = 1800        # 每轮间隔30分钟
-stock_delay = 5        # 每只股票间隔5秒
-```
-
-### 3. 运行系统
-
-```bash
-# 前台运行（测试）
-python main.py
-
-# 后台运行（生产）
-nohup python main.py > /dev/null 2>&1 &
-
-# 查看日志
-tail -f logs/scheduler.log
-```
-
-## 📊 核心模块
-
-### 调度器 (scheduler.py)
-
-24小时循环调度，智能管理IP池
-
-```python
-from core.scheduler import Crawler24HScheduler
-
-scheduler = Crawler24HScheduler()
-scheduler.run()
-```
-
-### 股票加载 (stock_loader.py)
-
-自动从AkShare获取所有A股
-
-```python
-from core.stock_loader import StockLoader
-
-loader = StockLoader()
-stocks = loader.get_all_stocks()  # ['600519', '000001', ...]
-```
-
-### 代理管理 (proxy_manager.py)
-
-Redis缓存代理，自动补充
-
-```python
-from core.proxy_manager import ProxyManager
-
-manager = ProxyManager()
-proxy = manager.get_random_proxy()  # {'http': '...', 'https': '...'}
-```
-
-### 日志系统 (logger.py)
-
-持久化日志，按天切割
-
-```python
-from storage.logger import get_logger
-
-logger = get_logger('my_module')
-logger.info("正常信息")
-logger.error("错误信息")
-```
-
-## 🔧 使用示例
-
-### 测试单个模块
-
-```bash
-# 测试日志
-python storage/logger.py
-
-# 测试股票加载
-python core/stock_loader.py
-
-# 测试代理池（需要Redis）
-python core/proxy_manager.py
-```
-
-### 查看运行状态
-
-```bash
-# 查看进程
-ps aux | grep main.py
-
-# 查看日志
-tail -100 logs/scheduler.log
-
-# 查看错误
-cat logs/error.log
-
-# 查看IP池
-redis-cli HGETALL guba:proxies:valid
-```
-
-### 停止系统
-
-```bash
-# 查找进程ID
-ps aux | grep main.py
-
-# 优雅停止
-kill -SIGINT <PID>
-
-# 强制停止
-kill -9 <PID>
-```
-
-## 📈 数据查询
-
-### MongoDB查询
-
-```python
-from database_client import DatabaseManager
-
-db = DatabaseManager('config/settings.ini')
-client = db.get_mongo_client('xiaoyi_db', 'stock_news')
-
-# 查看总数
-print(f"总数: {client.count_documents()}")
-
-# 查看某只股票
-docs = client.find({"stock_code": "600519"})
-for doc in docs:
-    print(doc['title'])
-```
-
-### Redis查询
-
-```bash
-# 查看代理数量
-redis-cli HLEN guba:proxies:valid
-
-# 查看所有代理
-redis-cli HGETALL guba:proxies:valid
-
-# 查看得分最高的代理
-redis-cli HSCAN guba:proxies:valid 0 MATCH * COUNT 100
-```
-
-## 🛡️ 生产环境部署
-
-### 使用Systemd管理
-
-创建 `/etc/systemd/system/guba-crawler.service`：
-
-```ini
-[Unit]
-Description=Guba Crawler Service
-After=network.target redis.service
-
-[Service]
-Type=simple
-User=your_user
-WorkingDirectory=/path/to/Guba-Crawler
-ExecStart=/usr/bin/python3 main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启动服务：
-
-```bash
-sudo systemctl start guba-crawler
-sudo systemctl enable guba-crawler
-sudo systemctl status guba-crawler
-```
-
-### 日志轮转
-
-日志已自动按天切割，保留30天
-
-### 监控告警
-
-可集成钉钉/企业微信webhook：
-
-```python
-# 在scheduler.py中添加
-def send_alert(msg):
-    import requests
-    webhook = "your_webhook_url"
-    requests.post(webhook, json={"text": msg})
-```
-
-## 🔍 故障排查
-
-### 1. Redis连接失败
-
-```bash
-# 检查Redis是否运行
-redis-cli ping
-
-# 启动Redis
-redis-server
-```
-
-### 2. MongoDB连接失败
-
-```bash
-# 检查配置
-cat config/settings.ini | grep MongoDB
-
-# 测试连接
-python test_db_connection.py
-```
-
-### 3. IP池耗尽
-
-```bash
-# 手动补充代理
-python core/proxy_manager.py
-
-# 查看代理数量
-redis-cli HLEN guba:proxies:valid
-```
-
-### 4. 查看错误日志
-
-```bash
-tail -50 logs/error.log
-```
-
-## 📝 版本历史
-
-### v2.0 (2026-01-23)
-- ✅ 重构为生产级架构
-- ✅ 24小时持续调度
-- ✅ Redis代理缓存
-- ✅ AkShare集成
-- ✅ 完整日志系统
-
-### v1.0
-- 基础多线程爬虫
-- 文件代理缓存
-- 手动股票列表
-
-## 📄 许可证
-
-MIT License
-
-## 🤝 贡献
-
-欢迎提交Issue和PR
+# 东方财富股吧爬虫系统 (Guba Crawler)
+
+这是一个生产级的高可用爬虫系统，专门用于抓取东方财富网股吧的**资讯、研报、公告**数据。系统设计目标是**24小时不间断运行**，具备自动反爬、智能IP池管理和数据完整性校验功能。
+
+## 🏗 系统架构原理
+
+### 1. 核心流程 (Core Logic)
+系统采用 **"并发下载 + 顺序处理"** 的混合模式，既保证了速度，又解决了业务逻辑的时序依赖问题。
+
+*   **并发下载 (ThreadPoolExecutor)**: 
+    *   使用多线程 (`max_workers=12`) 同时请求多个分页（如同时请求第1-12页）。
+    *   通过免费代理池或隧道代理自动切换IP，规避封锁。
+*   **顺序处理 (Sequential Processing)**: 
+    *   尽管下载是乱序完成的，但主线程严格按页码顺序（Page 1 -> Page 2 -> ...）处理数据。
+*   **反爬虫校验**:
+    *   自动提取页面源码中的 `count` 变量，与预期总数比对。如果返回的页面是反爬虫伪造的（内容无关但状态码200），系统会识别偏差并自动重试。
+
+### 2. 智能代理池 (Smart Proxy Pool - Independent 24h Thread)
+*   **独立线程架构**: 代理池维护逻辑被封装在独立的守护线程中 (`ProxyMaintenanceThread`)，不阻塞主爬虫流程。
+*   **持久化运行**: 无论主爬虫正在处理什么任务，该线程都会24小时持续运行，确保Redis中始终有足够可用的代理。
+*   **双重维护**: 默认每5分钟（可配置）检查一次代理池健康度。
+*   **自动评分**: 每次爬虫请求都会反馈代理质量，成功+5分，失败-10分，低于30分自动剔除。
+*   **自动补充**: 当可用代理数低于 `min_proxy_count` 时，自动从上游（如89ip等）重新抓取并验证。
+
+### 3. 数据持久化 (MongoDB)
+*   **复合索引**: 使用 `(stock_code, content_type, url_id)` 建立唯一索引，天然去重。
+*   **增量更新**: 每次爬取时，如果连续N页（默认2页）都是重复数据，自动跳过该股票的剩余页面，极大节省资源。
 
 ---
 
-**Made with ❤️ by Your Team**
+## 🚀 快速开始
+
+### 1. 环境依赖
+确保安装了 [Redis](https://redis.io/) 和 [MongoDB](https://www.mongodb.com/)。
+
+```bash
+pip install -r requirements.txt
+# 或手动安装核心包
+pip install requests beautifulsoup4 pymongo redis tenacity tqdm akshare
+```
+
+### 2. 配置文件 (`config.ini`)
+系统读取 `config.ini`，关键配置如下：
+
+```ini
+[MongoDB]
+host = localhost  # 数据库地址
+database = EastMoneyGubaNews
+
+[proxies]
+use_free_proxy_pool = true  # 启用免费代理池
+
+[Scheduler]
+mode = loop           # loop=死循环模式, once=单次模式
+stock_delay = 2       # 每只股票间隔2秒
+```
+
+### 3. 运行
+
+#### 直接运行某只股票（测试用）
+```bash
+python core/crawler.py
+```
+*注意：这会读取config.ini中的 `secCode` 进行单只测试。*
+
+#### 启动全量调度器（生产用）
+```bash
+python core/scheduler.py
+```
+*这将自动获取所有A股列表，开始循环爬取。*
+
+### 日志说明
+### 日志说明
+- `logs/run.log`: **[主日志]** 记录所有爬虫运行详情，按天切割，保留7天。日常查看这个即可。
+- `logs/err.log`: **[错误日志]** 仅记录程序崩溃、异常堆栈等严重错误。正常运行时应为空或很少内容。
+- `logs/console.log`: **[控制台镜像]** 记录最近一次启动时的控制台输出，用于排查启动问题。
+- `logs/startup_error.log`: **[启动报错]** 记录启动脚本因为环境问题导致的Python解释器报错（如ModuleNotFoundError）。
+
+---
+
+## ❓ 常见问题 (FAQ)
+
+### Q: 为什么感觉速度没有把宽带跑满？
+**A:** 系统设计上**故意限制了速度**。
+1.  **顺序处理限制**: 为了保证年份推断正确，我们必须等第1页处理完才能处理第2页（即使第2页已经下载好了）。
+2.  **写库瓶颈**: 这里的瓶颈通常在数据库写入（MongoDB远程连接）而非网络下载。
+3.  **反爬考量**: 过快的并发会导致IP池极速耗尽，导致大量重试（Retry），反而降低整体有效吞吐量。目前的配置（12线程 + 2秒间隔）是稳定性和速度的最佳平衡点。
+
+### Q: 代理池总是空的？
+**A:** 
+1.  检查本地 Redis 是否启动 (`redis-cli ping`)。
+2.  免费代理源（如89ip）可能暂时不可用，或者您的本地IP被源站限制。您可以尝试更换 `core/proxy_manager.py` 中的源地址。
+
+---
+
+## 📂 目录结构
+
+*   `core/`
+    *   `crawler.py`: 爬虫核心逻辑（单一职责：爬取、解析、入库）。
+    *   `scheduler.py`: 调度器（获取股票列表、循环调度、IP池守护）。
+    *   `proxy_manager.py`: 代理池实现（Redis交互）。
+*   `config.ini`: 配置文件。

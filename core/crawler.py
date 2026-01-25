@@ -20,7 +20,7 @@ from storage.database_client import DatabaseManager
 from core.user_agent_manager import get_user_agent_manager
 import time
 import random
-import threading
+
 import sys
 
 from tenacity import (
@@ -222,14 +222,9 @@ class guba_comments:
                 min_threshold=min_proxy_threshold,
                 target_count=target_proxy_count,
             )
-            # 如果代理池为空，异步启动补充，不要阻塞主流程
+            # 如果代理池为空，仅提示，不启动线程（由Scheduler统一管理）
             if self.proxy_pool.count() == 0:
-                print("⏳ 代理池为空，后台启动代理补充线程...")
-                threading.Thread(
-                    target=self.proxy_pool.build_pool,
-                    kwargs={"max_workers": 50, "max_per_source": 200},
-                    daemon=True,
-                ).start()
+                print("⚠️ 代理池为空，尝试使用现有代理或等待调度器补充...")
             else:
                 current_count = self.proxy_pool.count()
                 print(f"✅ 代理池就绪 (当前可用: {current_count})")
@@ -678,19 +673,28 @@ class guba_comments:
 
             except NetworkException as e:
                 # [新增] 专门处理 "soup is None" 这种情况
-                if is_last_page and "soup is None" in str(e):
-                    if empty_retries < 2:
-                        empty_retries += 1
-                        time.sleep(1)
-                        self.logger.info(
-                            f"页面{page} (最后一页?) 获取为空(soup=None)，重试第{empty_retries}次..."
-                        )
-                        continue
-                    else:
-                        self.logger.info(
-                            f"页面{page} (最后一页) 连续获取为空，视为正常结束"
-                        )
-                        return []
+                if "soup is None" in str(e):
+                    # 如果是最后一页，保留原有的容错逻辑
+                    if is_last_page:
+                        if empty_retries < 2:
+                            empty_retries += 1
+                            time.sleep(1)
+                            self.logger.info(
+                                f"页面{page} (最后一页?) 获取为空(soup=None)，重试第{empty_retries}次..."
+                            )
+                            continue
+                        else:
+                            self.logger.info(
+                                f"页面{page} (最后一页) 连续获取为空，视为正常结束"
+                            )
+                            return []
+
+                    # 对于非最后一页，如果soup is None，说明底层已经重试多次均失败
+                    # 此时直接放弃该页，不再进行外层重试
+                    self.logger.warning(
+                        f"页面{page} 无法获取数据 (soup is None)，放弃该页任务"
+                    )
+                    return []
 
                 # 其他网络错误，走正常重试
                 retry_count += 1

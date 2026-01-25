@@ -348,6 +348,67 @@ class ProxyManager:
 
         self.logger.info(f"✅ 验证完成，保留 {valid_count} 个有效代理\n")
 
+    def start_maintenance_loop(self, check_interval: int = 300, min_threshold: int = 5):
+        """
+        启动代理池维护循环（守护线程）
+        :param check_interval: 检查间隔（秒）
+        :param min_threshold: 最小可用数量阈值
+        """
+        if hasattr(self, "_maintenance_thread") and self._maintenance_thread.is_alive():
+            self.logger.warning("代理池维护线程已在运行")
+            return
+
+        self._running = True
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            args=(check_interval, min_threshold),
+            name="ProxyMaintenanceThread",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
+        self.logger.info("✓ 代理池维护线程已启动")
+
+    def stop_maintenance_loop(self):
+        """停止维护循环"""
+        self._running = False
+
+    def _maintenance_loop(self, check_interval, min_threshold):
+        """维护循环实体"""
+        self.logger.info(
+            f"代理池维护线程运行中 (阈值: {min_threshold}, 间隔: {check_interval}秒)"
+        )
+
+        # 首次检查
+        if self.count() < min_threshold:
+            self.logger.info(f"首次检测代理不足({self.count()})，执行初始补充...")
+            self.build_pool(max_workers=50, max_per_source=200)
+
+        while getattr(self, "_running", True):
+            try:
+                current_count = self.count()
+
+                if current_count < min_threshold:
+                    self.logger.warning(
+                        f"⚠️ [自动维护] 代理池不足: {current_count}/{min_threshold}，开始补充..."
+                    )
+                    # 1. 重新验证现有
+                    self.revalidate_pool()
+                    # 2. 如果仍不足，补充
+                    if self.count() < min_threshold:
+                        self.refill_pool(target_count=self.target_count)
+                        self.logger.info(
+                            f"✓ [自动维护] 补充完成，当前可用: {self.count()}"
+                        )
+                else:
+                    # self.logger.debug(f"[自动维护] 代理池健康 ({current_count}个)")
+                    pass
+
+                time.sleep(check_interval)
+
+            except Exception as e:
+                self.logger.error(f"代理池维护循环异常: {e}")
+                time.sleep(60)
+
     # 文件存储相关方法已移除，完全使用Redis管理
 
 

@@ -9,7 +9,7 @@ import time
 import sys
 import configparser
 from pathlib import Path
-import threading
+
 
 # 添加父目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -106,68 +106,10 @@ class Crawler24HScheduler:
 
     def _start_proxy_daemon(self):
         """启动代理池守护线程"""
-        if self.proxy_daemon_running:
-            return
-
-        self.proxy_daemon_running = True
-        self.proxy_daemon_thread = threading.Thread(
-            target=self._proxy_pool_daemon,
-            daemon=True,  # 守护线程，主进程退出时自动结束
-            name="ProxyPoolDaemon",
+        # 使用ProxyManager内置的维护循环
+        self.proxy_manager.start_maintenance_loop(
+            check_interval=self.ip_check_interval, min_threshold=self.min_proxy_count
         )
-        self.proxy_daemon_thread.start()
-        self.logger.info("✓ 代理池守护线程已启动")
-
-    def _proxy_pool_daemon(self):
-        """
-        代理池守护线程 - 持续监控并补充代理池
-        每5分钟检查一次，低于阈值自动补充
-        """
-        min_threshold = self.config.getint("proxies", "min_proxy_count", fallback=5)
-        check_interval = 300  # 每5分钟检查一次
-
-        self.logger.info(
-            f"代理池守护线程运行中 (阈值: {min_threshold}, 间隔: {check_interval}秒)"
-        )
-
-        # 首次加载：如果数量不足，立即补充
-        if self.proxy_manager.count() < self.min_proxy_count:
-            self.logger.info(
-                f"首次运行，代理不足({self.proxy_manager.count()})，建立代理池..."
-            )
-            self.proxy_manager.build_pool(max_workers=50, max_per_source=200)
-
-        while self.proxy_daemon_running:
-            try:
-                current_count = self.proxy_manager.count()
-
-                if current_count < min_threshold:
-                    self.logger.warning(
-                        f"⚠️ 代理池不足: {current_count}/{min_threshold}，开始补充..."
-                    )
-
-                    # 先重新验证现有代理
-                    self.proxy_manager.revalidate_pool()
-
-                    # 如果仍不足，抓取新代理
-                    if self.proxy_manager.count() < min_threshold:
-                        self.logger.info("重新抓取代理...")
-                        self.proxy_manager.build_pool(
-                            max_workers=50, max_per_source=200
-                        )
-
-                        self.logger.info(
-                            f"✓ 代理池补充完成: {self.proxy_manager.count()}个可用"
-                        )
-                else:
-                    self.logger.debug(f"代理池健康: {current_count}个可用")
-
-                # 等待下次检查
-                time.sleep(check_interval)
-
-            except Exception as e:
-                self.logger.error(f"代理池守护线程异常: {e}")
-                time.sleep(60)  # 异常后等待1分钟再重试
 
     def crawl_single_stock(self, stock_code: str) -> bool:
         """
