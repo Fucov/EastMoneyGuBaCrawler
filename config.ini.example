@@ -1,0 +1,64 @@
+[MongoDB]
+# MongoDB 数据库配置
+host = YOUR_MONGODB_HOST
+port = 27017
+username = YOUR_USERNAME
+password = YOUR_PASSWORD
+# 数据库名称，爬到的数据将存入此库
+database = EastMoneyGubaNews
+
+[Redis]
+# Redis 缓存配置 (用于代理池和去重)
+enabled = true
+host = localhost
+port = 6379
+password = 
+db = 0
+# 代理池在Redis中的Key
+proxy_cache_key = guba:proxies:valid
+
+[proxies]
+# 代理策略配置
+# 1. 如果拥有付费隧道代理 (如快代理)，将 enabled 设为 true 并填写 tunnel/username/password
+# 2. 如果使用免费代理池 (推荐)，将 use_free_proxy_pool 设为 true
+enabled = false
+use_free_proxy_pool = true
+# 代理池维护的最小数量，低于此值后台线程会自动补充
+min_proxy_count = 5
+# 补充时的目标数量
+target_count = 10
+
+[PaidProxyAPI]
+# 付费代理API配置 (share.proxy.qg.net)
+# API文档: https://share.proxy.qg.net/
+# 是否使用付费代理API（true=使用付费API, false=使用免费代理源）
+use_paid_api = false
+api_url = https://share.proxy.qg.net/get
+# 在此填入您的API Key
+api_key = YOUR_API_KEY_HERE
+
+[mainClass]
+# 爬虫核心参数
+# 数据库集合名称 (所有股票统一存入此集合)
+collectionName = stock_news
+# 单次任务的并发线程数
+# 建议设置为 8-16 左右。
+# 解释：虽然我们是并发下载，但为了保证"年份推断"的正确性，我们严格按页码顺序处理结果。
+# 因此，过大的并发数并不会线性提升写入速度，反而可能增加被封IP的风险。
+max_workers = 12
+
+[Scheduler]
+# 全局调度器配置 (scheduler.py)
+# mode: loop (无限循环，24小时运行) | once (跑完一轮所有A股就退出)
+mode = loop
+# 每一轮(所有A股跑一遍)之间的休息间隔(秒)
+interval = 3600
+# 两只股票之间的抓取间隔(秒)，避免请求过于密集
+stock_delay = 2
+# 代理池检查间隔(秒)
+ip_check_interval = 300
+
+[logging]
+# 日志配置
+log_file = main_controller.log
+log_level = INFO

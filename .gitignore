@@ -3,3 +3,5 @@
 *.html
 *.log
 .crawler.pid
+config.ini
+*/__pycache__/*

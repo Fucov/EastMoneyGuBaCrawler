@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict
 import random
 from storage.logger import get_system_logger
+import configparser
+import os
 
 import threading
 
@@ -33,6 +35,7 @@ class ProxyManager:
         min_threshold=5,
         target_count=20,
         context=None,
+        config_path=None,
     ):
         """
         初始化代理管理器
@@ -56,8 +59,42 @@ class ProxyManager:
         self.target_count = target_count
         self.context = context
 
-        # 代理源配置
-        self.sources = [
+        # 读取配置文件
+        if config_path is None:
+            # 默认从项目根目录读取config.ini
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            config_path = os.path.join(current_dir, "..", "config.ini")
+
+        config = configparser.ConfigParser()
+        config.read(config_path, encoding="utf-8")
+
+        # 读取是否使用付费API
+        self.use_paid_api = False
+        if config.has_section("PaidProxyAPI"):
+            self.use_paid_api = config.getboolean(
+                "PaidProxyAPI", "use_paid_api", fallback=False
+            )
+            self.paid_api_url = config.get(
+                "PaidProxyAPI", "api_url", fallback="https://share.proxy.qg.net/get"
+            )
+            self.paid_api_key = config.get("PaidProxyAPI", "api_key", fallback="")
+
+            if self.use_paid_api:
+                if not self.paid_api_key:
+                    self.logger.warning(
+                        "⚠️ 付费代理API已启用但Key未配置，请在config.ini中设置 [PaidProxyAPI] api_key"
+                    )
+                else:
+                    self.logger.info("✓ 使用付费代理API模式")
+            else:
+                self.logger.info("✓ 使用免费代理源模式")
+        else:
+            self.logger.info("✓ 使用免费代理源模式（未找到PaidProxyAPI配置）")
+            self.paid_api_url = "https://share.proxy.qg.net/get"
+            self.paid_api_key = ""
+
+        # 免费代理源配置
+        self.free_proxy_sources = [
             # 89ip API（新版）
             {
                 "type": "text",
@@ -180,59 +217,113 @@ class ProxyManager:
             self.redis_client.hset(self.cache_key, proxy_url, score)
 
     def fetch_raw_ips(self, max_per_source: int = 100) -> List[str]:
-        """从源站抓取原始IP列表"""
+        """从代理源提取代理（支持付费API和免费源两种模式）"""
         raw_list = []
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
 
-        self.logger.info("📡 开始抓取代理源...")
-        for source in self.sources:
-            try:
-                url = source["url"]
-                name = source["name"]
-                source_type = source["type"]
-                params = source.get("params", {})
+        if self.use_paid_api:
+            # 付费API模式
+            self.logger.info("📡 从付费API提取代理...")
 
-                if source_type == "zdaili_api":
-                    resp = requests.get(url, params=params, headers=headers, timeout=10)
-                    time.sleep(10)
+            params = {
+                "key": self.paid_api_key,
+                "num": min(max_per_source, 5),  # API每次最多返回5个
+                "area": "",
+                "isp": 0,
+                "format": "json",
+                "distinct": "true",
+            }
+
+            try:
+                resp = requests.get(
+                    self.paid_api_url, params=params, headers=headers, timeout=10
+                )
+                resp.raise_for_status()
+
+                data = resp.json()
+                code = data.get("code")
+
+                if code == "SUCCESS":
+                    proxy_list = data.get("data", [])
+                    for proxy_info in proxy_list:
+                        server = proxy_info.get("server")
+                        if server:
+                            raw_list.append(server)
+                            area = proxy_info.get("area", "未知")
+                            isp = proxy_info.get("isp", "未知")
+                            deadline = proxy_info.get("deadline", "未知")
+                            self.logger.info(
+                                f"  ✓ 提取代理: {server} (地区:{area}, 运营商:{isp}, 过期:{deadline})"
+                            )
+
+                    self.logger.info(f"  ✅ 成功提取 {len(proxy_list)} 个代理")
                 else:
+                    error_msg = data.get("message", "未知错误")
+                    request_id = data.get("request_id", "")
+                    self.logger.error(
+                        f"  ✗ API返回错误: {code} - {error_msg} (request_id: {request_id})"
+                    )
+
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"  ✗ API请求失败: {e}")
+            except Exception as e:
+                self.logger.error(f"  ✗ 解析响应失败: {e}")
+
+            if not raw_list:
+                self.logger.warning(
+                    "⚠️ 警告: 从付费API获取到的IP数量为0，请检查API配置和余额"
+                )
+
+        else:
+            # 免费代理源模式
+            self.logger.info("📡 开始抓取免费代理源...")
+            for source in self.free_proxy_sources:
+                try:
+                    url = source["url"]
+                    name = source["name"]
+                    source_type = source["type"]
+
                     resp = requests.get(url, headers=headers, timeout=10)
 
-                # 解析响应
-                if source_type == "zdaili_api":
-                    try:
-                        data = resp.json()
-                        code = str(data.get("code"))
-                        if code == "10001":
-                            proxy_list = data.get("data", {}).get("proxy_list", [])
-                            for proxy_info in proxy_list:
-                                ip = proxy_info.get("ip")
-                                port = proxy_info.get("port")
-                                if ip and port:
-                                    raw_list.append(f"{ip}:{port}")
-                            self.logger.info(f"  ✓ {name}: {len(proxy_list)}个")
-                        else:
-                            self.logger.warning(f"  ✗ {name}: {data.get('msg')}")
-                    except:
-                        pass
-                else:
-                    # 文本格式
-                    found = re.findall(r"\d+\.\d+\.\d+\.\d+[:：]\d+", resp.text)
-                    raw_list.extend(found)
-                    self.logger.info(f"  ✓ {name}: {len(found)}个")
+                    if source_type == "json_list":
+                        # JSON格式的代理列表
+                        try:
+                            data = resp.json()
+                            # 尝试多种可能的JSON结构
+                            items = data.get(
+                                "data", data.get("list", data.get("proxies", []))
+                            )
+                            found_count = 0
+                            for item in items:
+                                if isinstance(item, dict):
+                                    ip = item.get("ip", item.get("host", ""))
+                                    port = item.get("port", "")
+                                    if ip and port:
+                                        raw_list.append(f"{ip}:{port}")
+                                        found_count += 1
+                            self.logger.info(f"  ✓ {name}: {found_count}个")
+                        except Exception:
+                            pass
+                    else:
+                        # 文本格式
+                        found = re.findall(r"\d+\.\d+\.\d+\.\d+[:：]\d+", resp.text)
+                        raw_list.extend(found)
+                        self.logger.info(f"  ✓ {name}: {len(found)}个")
 
-            except Exception as e:
-                self.logger.warning(f"  ✗ {source['name']}: {e}")
+                except Exception as e:
+                    self.logger.warning(f"  ✗ {source['name']}: {e}")
 
-        unique_list = list(set(raw_list))
-        if not unique_list:
-            self.logger.warning(
-                "⚠️ 警告: 从所有源获取到的IP数量为0，请检查网络或源站可用性"
-            )
-        self.logger.info(f"📊 共抓取 {len(unique_list)} 个唯一代理\n")
-        return unique_list
+            unique_list = list(set(raw_list))
+            raw_list = unique_list
+            if not raw_list:
+                self.logger.warning(
+                    "⚠️ 警告: 从所有免费源获取到的IP数量为0，请检查网络或源站可用性"
+                )
+
+        self.logger.info(f"📊 共提取 {len(raw_list)} 个代理\n")
+        return raw_list
 
     def verify_proxy(self, proxy_str: str) -> Optional[str]:
         """验证代理是否可用"""
@@ -295,20 +386,38 @@ class ProxyManager:
                 score = max(100 - int(response_time * 20), 50)
                 # self.logger.debug(f" ✓ {proxy_url} (响应{response_time:.2f}s, 评分{score})")
                 return proxy_url, score
-        except:
+        except Exception:
             pass
-
         return None
 
     def build_pool(self, max_workers: int = 30, max_per_source: int = 100):
         """初始建立代理池"""
-        raw_ips = self.fetch_raw_ips(max_per_source)
+        all_raw_ips = []
+
+        if self.use_paid_api:
+            # 付费API模式：需要多次调用
+            calls_needed = (max_per_source + 4) // 5
+            self.logger.info(
+                f"📊 预计需要 {calls_needed} 次API调用以获取 {max_per_source} 个代理"
+            )
+
+            for i in range(calls_needed):
+                raw_ips = self.fetch_raw_ips(max_per_source=5)
+                all_raw_ips.extend(raw_ips)
+
+                # API限制：60次/分钟
+                if i < calls_needed - 1:
+                    time.sleep(1.2)
+        else:
+            # 免费代理模式：一次性抽取
+            all_raw_ips = self.fetch_raw_ips(max_per_source)
+
         self.logger.info(f"🔍 开始验证（{max_workers}线程）...\n")
 
         valid_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_proxy = {
-                executor.submit(self.verify_proxy, ip): ip for ip in raw_ips
+                executor.submit(self.verify_proxy, ip): ip for ip in all_raw_ips
             }
 
             for future in as_completed(future_to_proxy):
@@ -326,11 +435,39 @@ class ProxyManager:
         current = self.count()
         self.logger.info(f"🔄 代理池补充（当前{current}个，目标{target_count}个）")
 
-        raw_ips = self.fetch_raw_ips(max_per_source=100)
+        # 计算需要补充的数量
+        needed = max(0, target_count - current)
+        if needed == 0:
+            self.logger.info("✅ 代理池已足够，无需补充")
+            return
+
+        all_raw_ips = []
+
+        if self.use_paid_api:
+            # 付费API模式：多次调用直到达到目标
+            calls_needed = (needed + 4) // 5
+            self.logger.info(
+                f"📊 需要补充 {needed} 个代理，预计需要 {calls_needed} 次API调用"
+            )
+
+            for i in range(calls_needed):
+                raw_ips = self.fetch_raw_ips(max_per_source=5)
+                all_raw_ips.extend(raw_ips)
+
+                # 如果已经获取足够的代理，提前退出
+                if len(all_raw_ips) >= needed:
+                    break
+
+                # API限制：60次/分钟
+                if i < calls_needed - 1:
+                    time.sleep(1.2)
+        else:
+            # 免费代理模式：一次性抽取
+            all_raw_ips = self.fetch_raw_ips(max_per_source=100)
 
         # 过滤已存在的
         existing = set(self.redis_client.hkeys(self.cache_key))
-        new_ips = [ip for ip in raw_ips if f"http://{ip}" not in existing]
+        new_ips = [ip for ip in all_raw_ips if f"http://{ip}" not in existing]
 
         self.logger.info(f"📊 过滤后 {len(new_ips)} 个新候选")
 
@@ -452,7 +589,7 @@ if __name__ == "__main__":
     try:
         manager.redis_client.ping()
         print("✅ Redis连接成功\n")
-    except:
+    except Exception:
         print("❌ Redis连接失败，请启动Redis服务\n")
         exit(1)
 
