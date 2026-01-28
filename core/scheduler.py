@@ -64,6 +64,12 @@ class Crawler24HScheduler:
         self.stock_delay = self.config.getint("Scheduler", "stock_delay")
         self.ip_check_interval = self.config.getint("Scheduler", "ip_check_interval")
 
+        # 爬取顺序配置
+        self.start_code = self.config.get("Scheduler", "start_code", fallback="")
+        self.crawl_order = self.config.get(
+            "Scheduler", "crawl_order", fallback="asc"
+        ).lower()
+
         # 代理配置
         self.min_proxy_count = self.config.getint(
             "proxies", "min_proxy_count", fallback=5
@@ -192,6 +198,28 @@ class Crawler24HScheduler:
 
         self.logger.info(f"本轮目标：{len(stocks)}只股票")
 
+        # 排序
+        reverse_order = self.crawl_order == "desc"
+        stocks.sort(reverse=reverse_order)
+
+        # 过滤起点
+        if self.start_code:
+            original_count = len(stocks)
+            if reverse_order:
+                # 逆序：只保留 <= start_code 的股票
+                stocks = [s for s in stocks if s <= self.start_code]
+            else:
+                # 顺序：只保留 >= start_code 的股票
+                stocks = [s for s in stocks if s >= self.start_code]
+
+            self.logger.info(
+                f"应用起点过滤: {self.start_code} ({original_count} -> {len(stocks)})"
+            )
+
+        if not stocks:
+            self.logger.warning("过滤后没有待爬取的股票，请检查start_code配置")
+            return
+
         # 2. 检查IP池
         if not self.check_and_refill_proxies():
             self.logger.error("IP池不足且补充失败，等待1小时后重试")
@@ -234,6 +262,9 @@ class Crawler24HScheduler:
         self.logger.info(f"模式: {self.mode}")
         self.logger.info(f"轮次间隔: {self.interval}秒")
         self.logger.info(f"股票间延迟: {self.stock_delay}秒")
+        self.logger.info(
+            f"爬取顺序: {self.crawl_order}, 起点: {self.start_code or '全部'}"
+        )
         self.logger.info(f"IP池阈值: {self.min_proxy_count}")
 
         # 初始检查

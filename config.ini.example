@@ -55,6 +55,10 @@ interval = 3600
 stock_delay = 2
 # 代理池检查间隔(秒)
 ip_check_interval = 300
+# 起始股票代码 (不填默认从头/尾开始)
+start_code = 
+# 爬取顺序 (asc=顺序/desc=逆序)
+crawl_order = asc
 
 [logging]
 # 日志配置
