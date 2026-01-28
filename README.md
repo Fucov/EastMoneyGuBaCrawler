@@ -57,25 +57,30 @@ cp config.ini.example config.ini
 host = localhost  # 数据库地址
 database = EastMoneyGubaNews
 
-[PaidProxyAPI]
-# 代理模式选择：true=使用付费API, false=使用免费代理源
-use_paid_api = true
-api_url = https://share.proxy.qg.net/get
-api_key = YOUR_API_KEY_HERE  # 付费API密钥（仅在use_paid_api=true时需要）
-
 [proxies]
-use_free_proxy_pool = true  # 启用代理池
-min_proxy_count = 5         # 代理池最小数量
-target_count = 10           # 补充时的目标数量
+# 代理配置 (统一管理)
+enabled = true              # 是否启用代理池
+min_proxy_count = 5        # 最小数量阈值
+target_count = 10          # 补充时的目标数量
+max_proxy_count = 20       # 最大数量限制（防止浪费）
+use_paid_api = true        # 使用付费API还是免费代理源
+api_url = https://share.proxy.qg.net/get
+api_key = YOUR_API_KEY_HERE  # 付费API密钥
 
 [Scheduler]
 mode = loop           # loop=死循环模式, once=单次模式
 stock_delay = 2       # 每只股票间隔2秒
 ```
 
-**代理模式说明**：
-- **付费API模式** (`use_paid_api = true`): 使用稳定的付费代理服务，需要配置API Key，代理质量高但有成本
-- **免费代理模式** (`use_paid_api = false`): 从多个免费代理源抓取，无需API Key，免费但可能不稳定
+**代理配置说明**：
+- `enabled = true`: 启用代理池（必须设置为true才能使用代理）
+- `use_paid_api = true`: 使用付费API模式，质量高但有成本
+- `use_paid_api = false`: 使用免费代理源，免费但不稳定
+
+**代理池数量控制**：
+- `min_proxy_count`: 最小数量阈值，低于此值会自动补充
+- `target_count`: 补充时的目标数量
+- `max_proxy_count`: 最大数量限制，达到此值后停止获取新IP（防止浪费）
 
 > **重要提示**: `config.ini` 包含敏感信息（数据库密码、API密钥等），已添加到 `.gitignore`，不会被提交到版本控制系统。请勿将此文件分享或上传到公开仓库。
 

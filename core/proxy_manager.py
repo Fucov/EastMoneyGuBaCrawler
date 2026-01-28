@@ -34,6 +34,7 @@ class ProxyManager:
         target_url="https://guba.eastmoney.com/list,000001,1,f.html",
         min_threshold=5,
         target_count=20,
+        max_count=30,
         context=None,
         config_path=None,
     ):
@@ -57,6 +58,7 @@ class ProxyManager:
         self.timeout = 3
         self.min_threshold = min_threshold
         self.target_count = target_count
+        self.max_count = max_count  # 代理池最大数量
         self.context = context
 
         # 读取配置文件
@@ -68,28 +70,34 @@ class ProxyManager:
         config = configparser.ConfigParser()
         config.read(config_path, encoding="utf-8")
 
-        # 读取是否使用付费API
+        # 从统一的 [proxies] 部分读取配置
         self.use_paid_api = False
-        if config.has_section("PaidProxyAPI"):
+        if config.has_section("proxies"):
             self.use_paid_api = config.getboolean(
-                "PaidProxyAPI", "use_paid_api", fallback=False
+                "proxies", "use_paid_api", fallback=False
             )
             self.paid_api_url = config.get(
-                "PaidProxyAPI", "api_url", fallback="https://share.proxy.qg.net/get"
+                "proxies", "api_url", fallback="https://share.proxy.qg.net/get"
             )
-            self.paid_api_key = config.get("PaidProxyAPI", "api_key", fallback="")
+            self.paid_api_key = config.get("proxies", "api_key", fallback="")
 
             if self.use_paid_api:
-                if not self.paid_api_key:
+                if not self.paid_api_key or self.paid_api_key == "YOUR_API_KEY_HERE":
                     self.logger.warning(
-                        "⚠️ 付费代理API已启用但Key未配置，请在config.ini中设置 [PaidProxyAPI] api_key"
+                        "⚠️ 付费代理API已启用但Key未配置，请在config.ini中设置 [proxies] api_key"
                     )
                 else:
                     self.logger.info("✓ 使用付费代理API模式")
             else:
                 self.logger.info("✓ 使用免费代理源模式")
+
+            # 读取代理池最大值配置
+            self.max_count = config.getint(
+                "proxies", "max_proxy_count", fallback=self.max_count
+            )
+            self.logger.info(f"✓ 代理池最大值限制: {self.max_count}")
         else:
-            self.logger.info("✓ 使用免费代理源模式（未找到PaidProxyAPI配置）")
+            self.logger.info("✓ 使用免费代理源模式（未找到proxies配置）")
             self.paid_api_url = "https://share.proxy.qg.net/get"
             self.paid_api_key = ""
 
@@ -334,6 +342,7 @@ class ProxyManager:
         proxies = {"http": proxy_url, "https": proxy_url}
 
         try:
+            print(f"[VERIFY] Testing proxy: {proxy_url}")
             start_time = time.time()
             resp = requests.get(
                 self.test_url,
@@ -342,6 +351,9 @@ class ProxyManager:
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             response_time = time.time() - start_time
+            print(
+                f"[VERIFY] {proxy_url} - Status: {resp.status_code}, Time: {response_time:.2f}s"
+            )
 
             if resp.status_code == 200:
                 # [Based on User Request] 增加内容校验逻辑
@@ -349,6 +361,9 @@ class ProxyManager:
                 content = resp.content.decode("utf-8", "ignore")
 
                 if "var article_list" not in content:
+                    print(
+                        f"[VERIFY] {proxy_url} - FAIL: No 'var article_list' in content"
+                    )
                     return None
 
                 # [Refactor] 校验逻辑变更：不再检查count, 而是检查user_nickname后缀
@@ -371,23 +386,38 @@ class ProxyManager:
                             for item in items:
                                 nickname = item.get("user_nickname", "")
                                 if not nickname.endswith("资讯"):
-                                    # self.logger.debug(f"⚠️ {proxy_url} 返回异常昵称 ({nickname})")
+                                    print(
+                                        f"[VERIFY] {proxy_url} - FAIL: Invalid nickname '{nickname}'"
+                                    )
                                     return None
 
                         # 确保解析正常
                         if "count" not in article_list_data:
+                            print(
+                                f"[VERIFY] {proxy_url} - FAIL: No 'count' field in article_list"
+                            )
                             return None
                     else:
+                        print(f"[VERIFY] {proxy_url} - FAIL: Cannot find JSON start")
                         return None
 
-                except Exception:
+                except Exception as e:
+                    print(f"[VERIFY] {proxy_url} - FAIL: JSON parse error: {e}")
                     return None
 
                 score = max(100 - int(response_time * 20), 50)
-                # self.logger.debug(f" ✓ {proxy_url} (响应{response_time:.2f}s, 评分{score})")
+                print(f"[VERIFY] {proxy_url} - SUCCESS! Score: {score}")
                 return proxy_url, score
-        except Exception:
-            pass
+            else:
+                print(f"[VERIFY] {proxy_url} - FAIL: HTTP {resp.status_code}")
+        except requests.exceptions.Timeout:
+            print(f"[VERIFY] {proxy_url} - FAIL: Timeout")
+        except requests.exceptions.ProxyError as e:
+            print(f"[VERIFY] {proxy_url} - FAIL: Proxy error: {e}")
+        except requests.exceptions.ConnectionError as e:
+            print(f"[VERIFY] {proxy_url} - FAIL: Connection error: {e}")
+        except Exception as e:
+            print(f"[VERIFY] {proxy_url} - FAIL: Unexpected error: {e}")
         return None
 
     def build_pool(self, max_workers: int = 30, max_per_source: int = 100):
@@ -427,18 +457,43 @@ class ProxyManager:
                     self.add_proxy(proxy_url, score)
                     valid_count += 1
 
+                    # 检查是否达到最大值
+                    if self.count() >= self.max_count:
+                        self.logger.info(
+                            f"⚠️ 已达到代理池最大值 ({self.max_count})，停止获取"
+                        )
+                        break
+
         self.logger.info(f"\n✅ 验证完成，获得 {valid_count} 个有效代理")
         return valid_count
 
     def refill_pool(self, target_count: int = 20, max_workers: int = 30):
         """补充代理池"""
+        print(
+            f"[DEBUG] refill_pool called: target_count={target_count}, max_workers={max_workers}"
+        )
         current = self.count()
-        self.logger.info(f"🔄 代理池补充（当前{current}个，目标{target_count}个）")
+        print(f"[DEBUG] current count: {current}, max_count: {self.max_count}")
 
-        # 计算需要补充的数量
-        needed = max(0, target_count - current)
+        # 检查是否已达到最大值
+        if current >= self.max_count:
+            self.logger.info(
+                f"✅ 代理池已达到最大值 ({current}/{self.max_count})，无需补充"
+            )
+            print(f"[DEBUG] Reached max count, returning")
+            return
+
+        self.logger.info(
+            f"🔄 代理池补充（当前{current}个，目标{target_count}个，最大{self.max_count}个）"
+        )
+        print(f"[DEBUG] Starting refill process")
+
+        # 计算需要补充的数量，但不超过最大值
+        needed = min(max(0, target_count - current), self.max_count - current)
+        print(f"[DEBUG] needed: {needed}")
         if needed == 0:
             self.logger.info("✅ 代理池已足够，无需补充")
+            print(f"[DEBUG] needed=0, returning")
             return
 
         all_raw_ips = []
@@ -449,9 +504,12 @@ class ProxyManager:
             self.logger.info(
                 f"📊 需要补充 {needed} 个代理，预计需要 {calls_needed} 次API调用"
             )
+            print(f"[DEBUG] Paid API mode: calls_needed={calls_needed}")
 
             for i in range(calls_needed):
+                print(f"[DEBUG] API call {i + 1}/{calls_needed}")
                 raw_ips = self.fetch_raw_ips(max_per_source=5)
+                print(f"[DEBUG] Got {len(raw_ips)} raw IPs")
                 all_raw_ips.extend(raw_ips)
 
                 # 如果已经获取足够的代理，提前退出
@@ -463,13 +521,18 @@ class ProxyManager:
                     time.sleep(1.2)
         else:
             # 免费代理模式：一次性抽取
+            print(f"[DEBUG] Free proxy mode")
             all_raw_ips = self.fetch_raw_ips(max_per_source=100)
+            print(f"[DEBUG] Got {len(all_raw_ips)} raw IPs")
+
+        print(f"[DEBUG] Total raw IPs collected: {len(all_raw_ips)}")
 
         # 过滤已存在的
         existing = set(self.redis_client.hkeys(self.cache_key))
         new_ips = [ip for ip in all_raw_ips if f"http://{ip}" not in existing]
 
         self.logger.info(f"📊 过滤后 {len(new_ips)} 个新候选")
+        print(f"[DEBUG] new_ips after filtering: {len(new_ips)}")
 
         added = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -484,10 +547,17 @@ class ProxyManager:
                     self.add_proxy(proxy_url, score)
                     added += 1
 
-                    if self.count() >= target_count:
+                    # 检查是否达到目标或最大值
+                    current_count = self.count()
+                    if current_count >= target_count or current_count >= self.max_count:
+                        if current_count >= self.max_count:
+                            self.logger.info(
+                                f"⚠️ 已达到代理池最大值 ({self.max_count})，停止补充"
+                            )
                         break
 
         self.logger.info(f"✅ 补充完成，新增{added}个，当前共{self.count()}个\n")
+        print(f"[DEBUG] refill_pool completed: added {added}, total: {self.count()}")
 
     def revalidate_pool(self, max_workers: int = 20):
         """重新验证所有代理"""

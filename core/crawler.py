@@ -188,24 +188,14 @@ class guba_comments:
             "User-Agent": self.ua_manager.get_user_agent(),
         }
 
-        # 隧道域名:端口号
-        tunnel = "x291.kdltps.com:15818"
-
-        # 用户名密码方式
-        username = "t15462021520395"
-        password = "wkjzgkdb"
-
-        # 代理设置
+        # 代理配置 - 统一从 [proxies] 部分读取
         proxy_enabled = config.getboolean("proxies", "enabled", fallback=False)
-        use_free_proxy_pool = config.getboolean(
-            "proxies", "use_free_proxy_pool", fallback=False
-        )
 
         # 初始化代理池
         self.proxy_pool = None
-        if use_free_proxy_pool:
-            print("\n🔧 初始化免费代理池...")
-            # 从配置读取代理池阈值
+        if proxy_enabled:
+            print("\n🔧 初始化代理池...")
+            # 从配置读取代理池参数
             min_proxy_threshold = config.getint(
                 "proxies", "min_proxy_count", fallback=5
             )
@@ -222,35 +212,20 @@ class guba_comments:
                 min_threshold=min_proxy_threshold,
                 target_count=target_proxy_count,
                 context=self.secCode,
+                config_path=self.config_path,  # 传递配置文件路径
             )
-            # 如果代理池为空，仅提示，不启动线程（由Scheduler统一管理）
+
+            # 检查代理池状态
             if self.proxy_pool.count() == 0:
                 print("⚠️ 代理池为空，尝试使用现有代理或等待调度器补充...")
             else:
                 current_count = self.proxy_pool.count()
-                print(f"✅ 代理池就绪 (当前可用: {current_count})")
+                mode = "付费API" if self.proxy_pool.use_paid_api else "免费代理源"
+                print(f"✅ 代理池就绪 (模式: {mode}, 当前可用: {current_count})")
             print("")
 
-        if proxy_enabled and not use_free_proxy_pool:
-            # 使用配置文件中的固定代理
-            username = config.get("proxies", "username", fallback="t15462021520395")
-            password = config.get("proxies", "password", fallback="wkjzgkdb")
-            tunnel = config.get("proxies", "tunnel", fallback="")
-
-            self.proxies = {
-                "http": f"http://{username}:{password}@{tunnel}/",
-                "https": f"http://{username}:{password}@{tunnel}/",
-            }
-            self.backup_proxies = {
-                "http": f"http://{username}:{password}@x292.kdltps.com:15818/",
-                "https": f"http://{username}:{password}@x292.kdltps.com:15818/",
-            }
-            print("✓ 代理已启用")
-        elif use_free_proxy_pool:
-            # 使用免费代理池
-            self.proxies = None  # 动态获取
+            self.proxies = None  # 使用代理池而非固定代理
             self.backup_proxies = None
-            print("✓ 免费代理池已启用")
         else:
             self.proxies = None
             self.backup_proxies = None

@@ -36,6 +36,7 @@ class Crawler24HScheduler:
         # 读取配置
         self.config = configparser.ConfigParser()
         self.config.read(config_path, encoding="utf-8")
+        self.config_path = config_path  # 保存配置路径
 
         # 日志
         self.logger = get_logger("scheduler")
@@ -43,7 +44,7 @@ class Crawler24HScheduler:
         # 股票加载器
         self.stock_loader = StockLoader(exclude_st=True, exclude_delisted=True)
 
-        # 代理管理器
+        # 代理管理器 - 传递config_path以正确读取付费API配置
         redis_config = {
             "redis_host": self.config.get("Redis", "host"),
             "redis_port": self.config.getint("Redis", "port"),
@@ -53,6 +54,7 @@ class Crawler24HScheduler:
             "min_threshold": self.config.getint(
                 "proxies", "min_proxy_count", fallback=5
             ),
+            "config_path": config_path,  # 传递配置文件路径
         }
         self.proxy_manager = ProxyManager(**redis_config)
 
@@ -77,12 +79,13 @@ class Crawler24HScheduler:
         # 代理池守护线程控制
         self.proxy_daemon_running = False
         self.proxy_daemon_thread = None
-        self.use_free_proxy = self.config.getboolean(
-            "proxies", "use_free_proxy_pool", fallback=False
+        # 检查是否启用代理（统一配置）
+        self.proxy_enabled = self.config.getboolean(
+            "proxies", "enabled", fallback=False
         )
 
-        # 启动代理池守护线程（如果使用免费代理）
-        if self.use_free_proxy:
+        # 启动代理池守护线程（如果启用代理）
+        if self.proxy_enabled:
             self._start_proxy_daemon()
 
     def check_and_refill_proxies(self):

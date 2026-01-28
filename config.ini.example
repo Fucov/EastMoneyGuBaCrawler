@@ -18,21 +18,19 @@ db = 0
 proxy_cache_key = guba:proxies:valid
 
 [proxies]
-# 代理策略配置
-# 1. 如果拥有付费隧道代理 (如快代理)，将 enabled 设为 true 并填写 tunnel/username/password
-# 2. 如果使用免费代理池 (推荐)，将 use_free_proxy_pool 设为 true
+# 代理配置 (统一管理付费API和免费代理源)
+# enabled = true 启用代理池, false 禁用代理直接连接
 enabled = false
-use_free_proxy_pool = true
 # 代理池维护的最小数量，低于此值后台线程会自动补充
 min_proxy_count = 5
 # 补充时的目标数量
 target_count = 10
-
-[PaidProxyAPI]
-# 付费代理API配置 (share.proxy.qg.net)
-# API文档: https://share.proxy.qg.net/
+# 代理池最大数量限制，达到此值后停止获取新IP（防止浪费）
+max_proxy_count = 20
 # 是否使用付费代理API（true=使用付费API, false=使用免费代理源）
 use_paid_api = false
+# 付费代理API配置 (share.proxy.qg.net)
+# API文档: https://share.proxy.qg.net/
 api_url = https://share.proxy.qg.net/get
 # 在此填入您的API Key
 api_key = YOUR_API_KEY_HERE
