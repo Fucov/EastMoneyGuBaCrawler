@@ -220,7 +220,12 @@ class guba_comments:
                 print("⚠️ 代理池为空，尝试使用现有代理或等待调度器补充...")
             else:
                 current_count = self.proxy_pool.count()
-                mode = "付费API" if self.proxy_pool.use_paid_api else "免费代理源"
+                if self.proxy_pool.provider == "kdl":
+                    mode = "快代理(KDL)"
+                elif self.proxy_pool.provider == "qingguo":
+                    mode = "青果代理"
+                else:
+                    mode = "免费代理源"
                 print(f"✅ 代理池就绪 (模式: {mode}, 当前可用: {current_count})")
             print("")
 

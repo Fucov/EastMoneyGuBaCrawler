@@ -8,6 +8,10 @@ import random
 from storage.logger import get_system_logger
 import configparser
 import os
+import hmac
+import hashlib
+import base64
+from urllib.parse import urlparse
 
 import threading
 
@@ -70,36 +74,41 @@ class ProxyManager:
         config = configparser.ConfigParser()
         config.read(config_path, encoding="utf-8")
 
-        # 从统一的 [proxies] 部分读取配置
-        self.use_paid_api = False
+        # 读取代理提供商配置
+        self.provider = "free"
         if config.has_section("proxies"):
-            self.use_paid_api = config.getboolean(
+            self.provider = config.get("proxies", "provider", fallback="free")
+            # 兼容旧配置: use_paid_api=true -> qingguo
+            if self.provider == "free" and config.getboolean(
                 "proxies", "use_paid_api", fallback=False
-            )
-            self.paid_api_url = config.get(
-                "proxies", "api_url", fallback="https://share.proxy.qg.net/get"
-            )
-            self.paid_api_key = config.get("proxies", "api_key", fallback="")
+            ):
+                self.provider = "qingguo"
 
-            if self.use_paid_api:
-                if not self.paid_api_key or self.paid_api_key == "YOUR_API_KEY_HERE":
-                    self.logger.warning(
-                        "⚠️ 付费代理API已启用但Key未配置，请在config.ini中设置 [proxies] api_key"
-                    )
-                else:
-                    self.logger.info("✓ 使用付费代理API模式")
-            else:
-                self.logger.info("✓ 使用免费代理源模式")
+            # 青果配置
+            self.qingguo_url = config.get(
+                "proxies", "qingguo_api_url", fallback="https://share.proxy.qg.net/get"
+            )
+            self.qingguo_key = config.get("proxies", "qingguo_api_key", fallback="")
+
+            # KDL配置
+            self.kdl_url = config.get(
+                "proxies", "kdl_api_url", fallback="https://dps.kdlapi.com/api/getdps"
+            )
+            self.kdl_secret_id = config.get("proxies", "kdl_secret_id", fallback="")
+            self.kdl_secret_key = config.get("proxies", "kdl_secret_key", fallback="")
+            self.kdl_amount = config.getint("proxies", "kdl_amount", fallback=2)
+            self.kdl_sign_type = config.get(
+                "proxies", "kdl_sign_type", fallback="hmacsha1"
+            )
 
             # 读取代理池最大值配置
             self.max_count = config.getint(
                 "proxies", "max_proxy_count", fallback=self.max_count
             )
+            self.logger.info(f"✓ 代理提供商: {self.provider}")
             self.logger.info(f"✓ 代理池最大值限制: {self.max_count}")
         else:
             self.logger.info("✓ 使用免费代理源模式（未找到proxies配置）")
-            self.paid_api_url = "https://share.proxy.qg.net/get"
-            self.paid_api_key = ""
 
         # 免费代理源配置
         self.free_proxy_sources = [
@@ -224,114 +233,149 @@ class ProxyManager:
         else:
             self.redis_client.hset(self.cache_key, proxy_url, score)
 
-    def fetch_raw_ips(self, max_per_source: int = 100) -> List[str]:
-        """从代理源提取代理（支持付费API和免费源两种模式）"""
+    def _generate_kdl_signature(self, method, url, params):
+        """生成KDL签名"""
+        # 1. 解析URL获取path (e.g. /api/getdps)
+        parsed_url = urlparse(url)
+        path = parsed_url.path
+
+        # 2. 构造原文字符串: METHOD + path + ? + sorted_query_string
+        # 注意：KDL demo显示path可以不带域名，这里尝试使用path
+        s = f"{method.upper()}{path}?"
+
+        # 参数排序并拼接
+        query_parts = []
+        for k in sorted(params.keys()):
+            query_parts.append(f"{k}={params[k]}")
+        query_str = "&".join(query_parts)
+
+        raw_str = s + query_str
+
+        # 3. HMAC-SHA1加密
+        try:
+            hmac_str = hmac.new(
+                self.kdl_secret_key.encode("utf8"), raw_str.encode("utf8"), hashlib.sha1
+            ).digest()
+            signature = base64.b64encode(hmac_str).decode("utf-8")
+            return signature
+        except Exception as e:
+            self.logger.error(f"KDL签名生成失败: {e}")
+            return ""
+
+    def _fetch_from_kdl(self, max_per_source: int) -> List[str]:
+        """从KDL获取代理"""
         raw_list = []
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        self.logger.info("📡 [KDL] 开始提取私密代理...")
+
+        # 构造参数
+        params = {
+            "secret_id": self.kdl_secret_id,
+            "num": min(max_per_source, self.kdl_amount),
+            "sign_type": self.kdl_sign_type,
+            "timestamp": int(time.time()),
+            "nonce": random.randint(100000, 999999),
+            "format": "json",
+            "sep": 1,
+            "f_auth": 1,
+            "generateType": 4,
         }
 
-        if self.use_paid_api:
-            # 付费API模式
-            self.logger.info("📡 从付费API提取代理...")
+        # 生成签名
+        signature = self._generate_kdl_signature("GET", self.kdl_url, params)
+        params["signature"] = signature
 
-            params = {
-                "key": self.paid_api_key,
-                "num": min(max_per_source, 5),  # API每次最多返回5个
-                "area": "",
-                "isp": 0,
-                "format": "json",
-                "distinct": "true",
-            }
+        try:
+            resp = requests.get(self.kdl_url, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
 
-            try:
-                resp = requests.get(
-                    self.paid_api_url, params=params, headers=headers, timeout=10
-                )
-                resp.raise_for_status()
-
-                data = resp.json()
-                code = data.get("code")
-
-                if code == "SUCCESS":
-                    proxy_list = data.get("data", [])
-                    for proxy_info in proxy_list:
-                        server = proxy_info.get("server")
-                        if server:
-                            raw_list.append(server)
-                            area = proxy_info.get("area", "未知")
-                            isp = proxy_info.get("isp", "未知")
-                            deadline = proxy_info.get("deadline", "未知")
-                            self.logger.info(
-                                f"  ✓ 提取代理: {server} (地区:{area}, 运营商:{isp}, 过期:{deadline})"
-                            )
-
-                    self.logger.info(f"  ✅ 成功提取 {len(proxy_list)} 个代理")
-                else:
-                    error_msg = data.get("message", "未知错误")
-                    request_id = data.get("request_id", "")
-                    self.logger.error(
-                        f"  ✗ API返回错误: {code} - {error_msg} (request_id: {request_id})"
-                    )
-
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"  ✗ API请求失败: {e}")
-            except Exception as e:
-                self.logger.error(f"  ✗ 解析响应失败: {e}")
-
-            if not raw_list:
-                self.logger.warning(
-                    "⚠️ 警告: 从付费API获取到的IP数量为0，请检查API配置和余额"
+            if data.get("code") == 0:
+                proxy_list = data.get("data", {}).get("proxy_list", [])
+                raw_list.extend(proxy_list)
+                self.logger.info(f"  ✅ [KDL] 成功提取 {len(proxy_list)} 个代理")
+            else:
+                self.logger.error(
+                    f"  ✗ [KDL] API错误: {data.get('code')} - {data.get('msg')}"
                 )
 
-        else:
-            # 免费代理源模式
-            self.logger.info("📡 开始抓取免费代理源...")
-            for source in self.free_proxy_sources:
-                try:
-                    url = source["url"]
-                    name = source["name"]
-                    source_type = source["type"]
+        except Exception as e:
+            self.logger.error(f"  ✗ [KDL] 请求失败: {e}")
 
-                    resp = requests.get(url, headers=headers, timeout=10)
-
-                    if source_type == "json_list":
-                        # JSON格式的代理列表
-                        try:
-                            data = resp.json()
-                            # 尝试多种可能的JSON结构
-                            items = data.get(
-                                "data", data.get("list", data.get("proxies", []))
-                            )
-                            found_count = 0
-                            for item in items:
-                                if isinstance(item, dict):
-                                    ip = item.get("ip", item.get("host", ""))
-                                    port = item.get("port", "")
-                                    if ip and port:
-                                        raw_list.append(f"{ip}:{port}")
-                                        found_count += 1
-                            self.logger.info(f"  ✓ {name}: {found_count}个")
-                        except Exception:
-                            pass
-                    else:
-                        # 文本格式
-                        found = re.findall(r"\d+\.\d+\.\d+\.\d+[:：]\d+", resp.text)
-                        raw_list.extend(found)
-                        self.logger.info(f"  ✓ {name}: {len(found)}个")
-
-                except Exception as e:
-                    self.logger.warning(f"  ✗ {source['name']}: {e}")
-
-            unique_list = list(set(raw_list))
-            raw_list = unique_list
-            if not raw_list:
-                self.logger.warning(
-                    "⚠️ 警告: 从所有免费源获取到的IP数量为0，请检查网络或源站可用性"
-                )
-
-        self.logger.info(f"📊 共提取 {len(raw_list)} 个代理\n")
         return raw_list
+
+    def _fetch_from_qingguo(self, max_per_source: int) -> List[str]:
+        """从青果获取代理"""
+        raw_list = []
+        self.logger.info("📡 [青果] 开始提取代理...")
+
+        params = {
+            "key": self.qingguo_key,
+            "num": min(max_per_source, 5),
+            "area": "",
+            "isp": 0,
+            "format": "json",
+            "distinct": "true",
+        }
+
+        try:
+            resp = requests.get(self.qingguo_url, params=params, timeout=10)
+            data = resp.json()
+
+            if data.get("code") == "SUCCESS":
+                proxy_list = data.get("data", [])
+                for p in proxy_list:
+                    server = p.get("server")
+                    if server:
+                        raw_list.append(server)
+                self.logger.info(f"  ✅ [青果] 成功提取 {len(raw_list)} 个代理")
+            else:
+                self.logger.error(f"  ✗ [青果] API错误: {data.get('message')}")
+        except Exception as e:
+            self.logger.error(f"  ✗ [青果] 请求失败: {e}")
+
+        return raw_list
+
+    def _fetch_from_free(self) -> List[str]:
+        """获取免费代理"""
+        raw_list = []
+        self.logger.info("📡 [Free] 开始提取免费代理...")
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        for source in self.free_proxy_sources:
+            try:
+                resp = requests.get(source["url"], headers=headers, timeout=10)
+                if source["type"] == "json_list":
+                    # 简单JSON解析逻辑...
+                    try:
+                        data = resp.json()
+                        items = data.get(
+                            "data", data.get("list", data.get("proxies", []))
+                        )
+                        for item in items:
+                            if isinstance(item, dict):
+                                ip = item.get("ip", item.get("host"))
+                                port = item.get("port")
+                                if ip and port:
+                                    raw_list.append(f"{ip}:{port}")
+                    except:
+                        pass
+                else:
+                    found = re.findall(r"\d+\.\d+\.\d+\.\d+[:：]\d+", resp.text)
+                    raw_list.extend(found)
+                self.logger.info(f"  ✓ {source['name']}: {len(raw_list)} (cumulative)")
+            except Exception as e:
+                pass
+
+        return raw_list
+
+    def fetch_raw_ips(self, max_per_source: int = 100) -> List[str]:
+        """从代理源提取代理（根据provider配置）"""
+        if self.provider == "kdl":
+            return self._fetch_from_kdl(max_per_source)
+        elif self.provider == "qingguo":
+            return self._fetch_from_qingguo(max_per_source)
+        else:
+            return self._fetch_from_free()
 
     def verify_proxy(self, proxy_str: str) -> Optional[str]:
         """验证代理是否可用"""
@@ -424,9 +468,13 @@ class ProxyManager:
         """初始建立代理池"""
         all_raw_ips = []
 
-        if self.use_paid_api:
+        if self.provider == "kdl" or self.provider == "qingguo":
             # 付费API模式：需要多次调用
             calls_needed = (max_per_source + 4) // 5
+            if self.provider == "kdl":
+                # KDL每次可以取 amount 个, 简单起见按 amount 估算
+                calls_needed = (max_per_source + self.kdl_amount - 1) // self.kdl_amount
+
             self.logger.info(
                 f"📊 预计需要 {calls_needed} 次API调用以获取 {max_per_source} 个代理"
             )
@@ -498,7 +546,7 @@ class ProxyManager:
 
         all_raw_ips = []
 
-        if self.use_paid_api:
+        if self.provider == "kdl" or self.provider == "qingguo":
             # 付费API模式：多次调用直到达到目标
             calls_needed = (needed + 4) // 5
             self.logger.info(
