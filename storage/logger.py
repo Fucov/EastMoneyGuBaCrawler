@@ -55,6 +55,7 @@ def setup_logging():
     if not sys_logger.handlers:
         detail_handler = RotatingFileHandler(
             "logs/details.log",
+            mode="w",  # 每次启动时清空旧日志
             maxBytes=20 * 1024 * 1024,
             backupCount=5,
             encoding="utf-8",

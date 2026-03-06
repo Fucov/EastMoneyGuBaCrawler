@@ -14,7 +14,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from core.scheduler import Crawler24HScheduler
-from storage.logger import get_logger
+from storage.logger import get_logger,setup_logging
 
 
 def signal_handler(sig, frame):
@@ -31,6 +31,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     # 初始化日志
+    setup_logging()
     logger = get_logger('main')
     
     print("="*60)
