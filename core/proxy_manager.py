@@ -85,10 +85,14 @@ class ProxyManager:
                 self.provider = "qingguo"
 
             # 青果配置
+            # 优先读取 qingguo_api_url，如果没有则尝试读取 api_url (兼容旧配置)
             self.qingguo_url = config.get(
-                "proxies", "qingguo_api_url", fallback="https://share.proxy.qg.net/get"
+                "proxies", "qingguo_api_url", fallback=config.get("proxies", "api_url", fallback="https://share.proxy.qg.net/get")
             )
-            self.qingguo_key = config.get("proxies", "qingguo_api_key", fallback="")
+            # 优先读取 qingguo_api_key，如果没有则尝试读取 api_key (兼容旧配置)
+            self.qingguo_key = config.get(
+                "proxies", "qingguo_api_key", fallback=config.get("proxies", "api_key", fallback="")
+            )
 
             # KDL配置
             self.kdl_url = config.get(
@@ -100,6 +104,12 @@ class ProxyManager:
             self.kdl_sign_type = config.get(
                 "proxies", "kdl_sign_type", fallback="hmacsha1"
             )
+
+            # [New] 读取代理认证信息 (Auth User/Pass)
+            self.proxy_auth_user = config.get("proxies", "auth_user", fallback="")
+            self.proxy_auth_pass = config.get("proxies", "auth_password", fallback="")
+            if self.proxy_auth_user and self.proxy_auth_pass:
+                self.logger.info(f"✓ 启用代理认证: 用户名={self.proxy_auth_user}")
 
             # 读取代理池最大值配置
             self.max_count = config.getint(
@@ -383,10 +393,19 @@ class ProxyManager:
         if not proxy_url.startswith("http"):
             proxy_url = "http://" + proxy_url
 
-        proxies = {"http": proxy_url, "https": proxy_url}
+        # [Modified] 支持用户名密码认证
+        final_proxy_url = proxy_url
+        if hasattr(self, 'proxy_auth_user') and hasattr(self, 'proxy_auth_pass') \
+                and self.proxy_auth_user and self.proxy_auth_pass:
+            # 提取IP和端口
+            clean_ip = proxy_url.replace("http://", "").replace("https://", "")
+            # 构造带认证的URL: http://user:pass@ip:port
+            final_proxy_url = f"http://{self.proxy_auth_user}:{self.proxy_auth_pass}@{clean_ip}"
+            
+        proxies = {"http": final_proxy_url, "https": final_proxy_url}
 
         try:
-            print(f"[VERIFY] Testing proxy: {proxy_url}")
+            print(f"[VERIFY] Testing proxy: {proxy_url} (Auth: {'Yes' if final_proxy_url != proxy_url else 'No'})")
             start_time = time.time()
             resp = requests.get(
                 self.test_url,
@@ -451,7 +470,9 @@ class ProxyManager:
 
                 score = max(100 - int(response_time * 20), 50)
                 print(f"[VERIFY] {proxy_url} - SUCCESS! Score: {score}")
-                return proxy_url, score
+                
+                # [Modified] 返回带认证信息的URL以便存储
+                return final_proxy_url, score
             else:
                 print(f"[VERIFY] {proxy_url} - FAIL: HTTP {resp.status_code}")
         except requests.exceptions.Timeout:
